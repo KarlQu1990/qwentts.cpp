@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -282,6 +283,31 @@ static int run(const Args & a) {
         ref_text = ref_text_buf.c_str();
     }
 
+    // Decode the reference WAV once, mono at the codec sample rate. The
+    // pipeline consumes the buffer directly so the WAV is read exactly
+    // once regardless of how many encoders need the audio (speaker
+    // encoder embedding + codec encoder RVQ codes for ICL mode B).
+    std::vector<float>                       ref_audio_buf;
+    std::unique_ptr<float, void (*)(void *)> raw_holder(NULL, std::free);
+    const float *                            ref_audio_24k = NULL;
+    int                                      ref_n_samples = 0;
+    if (a.ref_audio) {
+        int     T_in = 0;
+        float * raw  = audio_read_mono(a.ref_audio, QWEN_TOKENIZER_SAMPLE_RATE, &T_in);
+        if (!raw || T_in <= 0) {
+            fprintf(stderr, "[CLI] ERROR: cannot read --ref-audio '%s'\n", a.ref_audio);
+            if (raw) {
+                std::free(raw);
+            }
+            pipeline_tts_free(&pt);
+            backend_release(bp.backend, bp.cpu_backend);
+            return 1;
+        }
+        raw_holder.reset(raw);
+        ref_audio_24k = raw;
+        ref_n_samples = T_in;
+    }
+
     // Resolve output WAV format string : wav16 / wav24 / wav32. Default
     // wav16 mirrors the omnivoice.cpp default.
     WavFormat wav_fmt;
@@ -333,7 +359,8 @@ static int run(const Args & a) {
     p.lang                        = a.lang;
     p.instruct                    = a.instruct;
     p.speaker                     = a.speaker;
-    p.ref_audio                   = a.ref_audio;
+    p.ref_audio_24k               = ref_audio_24k;
+    p.ref_n_samples               = ref_n_samples;
     p.ref_text                    = ref_text;
     p.seed                        = seed;
     p.max_new_tokens              = a.max_new_tokens;

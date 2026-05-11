@@ -111,24 +111,25 @@ struct BPETokenizer;
 // captures step 0 prefill activations plus the codes-full / output-audio
 // dumps under the named directory ; debug only, slows the run.
 struct PipelineTTSSynthesizeParams {
-    const char * text;
-    const char * lang;
-    const char * instruct;
-    const char * speaker;
-    const char * ref_audio;
-    const char * ref_text;
-    int64_t      seed;
-    int          max_new_tokens;
-    bool         do_sample;
-    float        temperature;
-    int          top_k;
-    float        top_p;
-    float        repetition_penalty;
-    bool         subtalker_do_sample;
-    float        subtalker_temperature;
-    int          subtalker_top_k;
-    float        subtalker_top_p;
-    const char * dump_dir;
+    const char *  text;
+    const char *  lang;
+    const char *  instruct;
+    const char *  speaker;
+    const float * ref_audio_24k;
+    int           ref_n_samples;
+    const char *  ref_text;
+    int64_t       seed;
+    int           max_new_tokens;
+    bool          do_sample;
+    float         temperature;
+    int           top_k;
+    float         top_p;
+    float         repetition_penalty;
+    bool          subtalker_do_sample;
+    float         subtalker_temperature;
+    int           subtalker_top_k;
+    float         subtalker_top_p;
+    const char *  dump_dir;
 };
 
 // Output of one synthesis call. audio is a 24 kHz mono F32 PCM buffer

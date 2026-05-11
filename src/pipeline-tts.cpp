@@ -279,18 +279,21 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
     const std::string   speaker  = params.speaker ? params.speaker : "";
     const std::string   ref_text = params.ref_text ? params.ref_text : "";
 
-    // Voice clone mode A : if ref_audio is given, run the speaker
-    // encoder on the WAV and feed the resulting embedding straight into
-    // the prompt builder. Mutually exclusive with --speaker.
+    // Voice clone mode A : if ref_audio_24k is given, run the speaker
+    // encoder on the pre-decoded mono buffer and feed the resulting
+    // embedding straight into the prompt builder. Mutually exclusive
+    // with --speaker.
+    const bool         has_ref_audio = (params.ref_audio_24k != NULL) && (params.ref_n_samples > 0);
     std::vector<float> ref_spk_emb;
     const float *      ref_spk_emb_ptr = NULL;
-    if (params.ref_audio && params.ref_audio[0]) {
+    if (has_ref_audio) {
         if (!pt->has_speaker_encoder) {
             fprintf(stderr,
                     "[Pipeline] FATAL: --ref-audio requires a model with a loaded speaker encoder (Base only)\n");
             return false;
         }
-        if (!speaker_encoder_extract(&pt->speaker_encoder, pt->sched, params.ref_audio, ref_spk_emb, params.dump_dir)) {
+        if (!speaker_encoder_extract(&pt->speaker_encoder, pt->sched, params.ref_audio_24k, params.ref_n_samples,
+                                     ref_spk_emb, params.dump_dir)) {
             return false;
         }
         if ((int) ref_spk_emb.size() != pt->talker.hidden_size) {
@@ -309,25 +312,18 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
     std::vector<int32_t> ref_codes;
     int                  ref_codes_T = 0;
     if (!ref_text.empty()) {
-        if (!params.ref_audio || !params.ref_audio[0]) {
+        if (!has_ref_audio) {
             fprintf(stderr, "[Pipeline] FATAL: --ref-text requires --ref-audio\n");
             return false;
         }
-        // audio_read_mono returns f32 mono at the codec sample rate. The
-        // codec hop is 1920 samples at 24 kHz so n_samples must be a
-        // multiple of 1920. Truncate to the nearest hop boundary.
-        int     T_codec_audio = 0;
-        float * raw           = audio_read_mono(params.ref_audio, QWEN_TOKENIZER_SAMPLE_RATE, &T_codec_audio);
-        if (!raw || T_codec_audio < QWEN_TOKENIZER_HOP_LENGTH) {
-            fprintf(stderr, "[Pipeline] FATAL: cannot read ref_audio for ICL '%s'\n", params.ref_audio);
-            if (raw) {
-                std::free(raw);
-            }
+        // The codec hop is 1920 samples at 24 kHz so n_samples must be
+        // a multiple of 1920. Truncate to the nearest hop boundary.
+        if (params.ref_n_samples < QWEN_TOKENIZER_HOP_LENGTH) {
+            fprintf(stderr, "[Pipeline] FATAL: ref_audio too short for ICL (%d samples)\n", params.ref_n_samples);
             return false;
         }
-        int aligned_T = (T_codec_audio / QWEN_TOKENIZER_HOP_LENGTH) * QWEN_TOKENIZER_HOP_LENGTH;
-        ref_codes     = pipeline_codec_encode(&pt->codec, raw, aligned_T, params.dump_dir);
-        std::free(raw);
+        int aligned_T = (params.ref_n_samples / QWEN_TOKENIZER_HOP_LENGTH) * QWEN_TOKENIZER_HOP_LENGTH;
+        ref_codes     = pipeline_codec_encode(&pt->codec, params.ref_audio_24k, aligned_T, params.dump_dir);
         if (ref_codes.empty()) {
             fprintf(stderr, "[Pipeline] FATAL: pipeline_codec_encode returned empty codes\n");
             return false;

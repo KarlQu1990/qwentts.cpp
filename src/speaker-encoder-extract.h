@@ -31,16 +31,22 @@
 #include <vector>
 
 // Public entry point. Returns true on success, fills emb_out with the
-// 2048-dim f32 embedding. When dump_dir is non NULL, also writes the post
-// mel_spectrogram tensor to mel-spk.bin under that directory using the
-// debug.h header format. Quiet otherwise.
+// 2048-dim f32 embedding. The audio buffer must already be mono at
+// sw->sample_rate (24 kHz). When dump_dir is non NULL, also writes the
+// post mel_spectrogram tensor to mel-spk.bin under that directory using
+// the debug.h header format. Quiet otherwise.
 static bool speaker_encoder_extract(const SpeakerEncoderWeights * sw,
                                     ggml_backend_sched_t          sched,
-                                    const char *                  wav_path,
+                                    const float *                 audio,
+                                    int                           n_samples,
                                     std::vector<float> &          emb_out,
                                     const char *                  dump_dir = NULL) {
     if (sw->weight_buf == NULL) {
         fprintf(stderr, "[SpkExtract] FATAL: speaker encoder weights not loaded\n");
+        return false;
+    }
+    if (!audio || n_samples <= 0) {
+        fprintf(stderr, "[SpkExtract] FATAL: empty audio buffer\n");
         return false;
     }
 
@@ -52,18 +58,8 @@ static bool speaker_encoder_extract(const SpeakerEncoderWeights * sw,
     mel_cfg.fmin        = 0.0f;
     mel_cfg.fmax        = 12000.0f;
 
-    // Load WAV, mono mix, resample to 24 kHz. audio_read_mono allocates
-    // with malloc, wrap in a unique_ptr for clean release.
-    int     T_in = 0;
-    float * raw  = audio_read_mono(wav_path, sw->sample_rate, &T_in);
-    if (!raw || T_in <= 0) {
-        fprintf(stderr, "[SpkExtract] FATAL: cannot read WAV '%s'\n", wav_path);
-        if (raw) {
-            std::free(raw);
-        }
-        return false;
-    }
-    std::unique_ptr<float, void (*)(void *)> raw_holder(raw, std::free);
+    const int     T_in = n_samples;
+    const float * raw  = audio;
 
     const int pad   = (mel_cfg.n_fft - mel_cfg.hop) / 2;  // 384
     const int T_pad = T_in + 2 * pad;
@@ -290,7 +286,6 @@ static bool speaker_encoder_extract(const SpeakerEncoderWeights * sw,
     ggml_backend_sched_reset(sched);
     ggml_free(gctx);
 
-    fprintf(stderr, "[SpkExtract] Extracted %d-dim embedding from %s (%d samples, padded %d)\n", sw->enc_dim, wav_path,
-            T_in, T_pad);
+    fprintf(stderr, "[SpkExtract] Extracted %d-dim embedding (%d samples, padded %d)\n", sw->enc_dim, T_in, T_pad);
     return true;
 }
