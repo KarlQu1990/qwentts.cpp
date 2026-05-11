@@ -266,6 +266,91 @@ static struct ggml_tensor * gf_load_tensor_f32(WeightCtx * wctx, const GGUFModel
     return tensor;
 }
 
+// Load a Conv1d / Conv1dDW kernel weight, forcing F16 storage on the
+// backend regardless of the source GGUF dtype.
+//
+// TODO upstream GGML : ggml_conv_1d and ggml_conv_1d_dw in
+// ggml/src/ggml.c hardcode dst_type = GGML_TYPE_F16 in their internal
+// ggml_im2col call (currently ggml.c lines around 4508 and 4542).
+// ggml_conv_2d at the equivalent site uses the adaptive pattern
+// dst_type = a->type (around line 4595). Two backend bugs follow.
+//
+//   1) CPU im2col dispatches on dst->type. The im2col_f16 path
+//      asserts src0->type == GGML_TYPE_F16, so a F32 or BF16 conv
+//      kernel crashes on CPU.
+//   2) ggml_conv_1d lowers to ggml_mul_mat(im2col, reshape(weight))
+//      where the weight ends up as src1, not src0. The Vulkan fast
+//      path ggml_vk_get_dequantize_mul_mat_vec asserts b_type in
+//      {F32, F16, Q8_1}, so a BF16 conv kernel crashes on Vulkan
+//      even when im2col itself succeeds.
+//
+// Vulkan does ship a pipeline_im2col_f32 and CUDA handles both F32
+// and F16 cleanly, so the fix upstream is to align ggml_conv_1d and
+// ggml_conv_1d_dw on ggml_conv_2d's adaptive a->type pattern. Until
+// that lands, the only safe assumption across CPU, CUDA, and Vulkan
+// is F16 kernels everywhere, so we mirror ggml_conv_1d's hardcoded
+// choice here and load every conv kernel as F16 regardless of source
+// dtype. F16 source is a direct passthrough, F32 and BF16 widen
+// through a F32 staging buffer.
+static struct ggml_tensor * gf_load_conv(WeightCtx * wctx, const GGUFModel & gf, const std::string & name) {
+    int64_t idx = gguf_find_tensor(gf.gguf, name.c_str());
+    if (idx < 0) {
+        fprintf(stderr, "[GGUF] FATAL: tensor '%s' not found\n", name.c_str());
+        exit(1);
+    }
+    struct ggml_tensor * src    = ggml_get_tensor(gf.meta, name.c_str());
+    int                  n_dims = ggml_n_dims(src);
+    int64_t              ne[4]  = { 1, 1, 1, 1 };
+    for (int i = 0; i < n_dims; i++) {
+        ne[i] = src->ne[i];
+    }
+
+    // F16 source : direct passthrough, no conversion.
+    if (src->type == GGML_TYPE_F16) {
+        return gf_load_tensor(wctx, gf, name);
+    }
+    if (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_BF16) {
+        fprintf(stderr, "[GGUF] FATAL: gf_load_conv unsupported source type %s for '%s'\n", ggml_type_name(src->type),
+                name.c_str());
+        exit(1);
+    }
+
+    // Allocate F16 backend tensor in the WeightCtx graph.
+    struct ggml_tensor * tensor = ggml_new_tensor(wctx->ctx, GGML_TYPE_F16, n_dims, ne);
+    ggml_set_name(tensor, name.c_str());
+
+    size_t       n       = (size_t) ggml_nelements(src);
+    size_t       raw_off = gguf_get_tensor_offset(gf.gguf, idx);
+    const void * raw     = gf.mapping + gf.data_offset + raw_off;
+
+    // The staging vector owns float[] buffers to keep memory alive
+    // until wctx_alloc copies it to the backend. n F16 elements
+    // occupy n * 2 bytes, which fits in (n + 1) / 2 floats. The
+    // pending entry references the same buffer reinterpreted as
+    // ggml_fp16_t and carries the exact F16 byte count.
+    size_t        n_floats = (n + 1) / 2;
+    auto          buf      = std::make_unique<float[]>(n_floats);
+    ggml_fp16_t * data     = (ggml_fp16_t *) buf.get();
+
+    if (src->type == GGML_TYPE_F32) {
+        ggml_fp32_to_fp16_row((const float *) raw, data, (int) n);
+    } else {
+        // BF16 source : widen to F32 first, then narrow to F16 in
+        // one pass to preserve mantissa bits the BF16-to-F16 direct
+        // cast would otherwise leave undefined.
+        std::vector<float> f32(n);
+        const uint16_t *   p = (const uint16_t *) raw;
+        for (size_t i = 0; i < n; i++) {
+            f32[i] = ggml_bf16_to_fp32(*(const ggml_bf16_t *) &p[i]);
+        }
+        ggml_fp32_to_fp16_row(f32.data(), data, (int) n);
+    }
+
+    wctx->pending.push_back({ tensor, (const void *) data, n * sizeof(ggml_fp16_t), 0 });
+    wctx->staging.push_back(std::move(buf));
+    return tensor;
+}
+
 // Get raw pointer to tensor data in the mmapped file.
 // Useful for CPU-side operations (e.g. bf16 embed lookup for lyrics).
 // Returns NULL if not found.
@@ -288,53 +373,6 @@ static enum ggml_type gf_get_type(const GGUFModel & gf, const std::string & name
         exit(1);
     }
     return src->type;
-}
-
-// Load a Conv1d weight onto an F16 backend tensor regardless of the source
-// dtype. Mandatory on ARM aarch64 : the CPU im2col op asserts src0 is F16,
-// while x86 silently accepts BF16 / F32. F16 source memcpy passes through ;
-// F32 / BF16 widen ; Q8_0 / Q4_K / Q5_K / Q6_K dequantize via type traits.
-// The destination tensor must be allocated as GGML_TYPE_F16.
-static void gf_load_conv_f16(struct ggml_tensor * dst, const GGUFModel & gf, const std::string & name) {
-    struct ggml_tensor * src = ggml_get_tensor(gf.meta, name.c_str());
-    if (!src) {
-        fprintf(stderr, "[GGUF] FATAL: tensor '%s' not in meta context\n", name.c_str());
-        exit(1);
-    }
-    GGML_ASSERT(dst->type == GGML_TYPE_F16);
-    GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src));
-
-    const void * raw = gf_get_data(gf, name.c_str());
-    size_t       n   = (size_t) ggml_nelements(src);
-
-    // F16 source : direct memcpy, no conversion needed.
-    if (src->type == GGML_TYPE_F16) {
-        ggml_backend_tensor_set(dst, raw, 0, ggml_nbytes(dst));
-        return;
-    }
-
-    // All other types widen / dequantize to F32, then cast down to F16.
-    std::vector<float> f32(n);
-    if (src->type == GGML_TYPE_F32) {
-        memcpy(f32.data(), raw, n * sizeof(float));
-    } else if (src->type == GGML_TYPE_BF16) {
-        const uint16_t * p = (const uint16_t *) raw;
-        for (size_t i = 0; i < n; i++) {
-            f32[i] = ggml_bf16_to_fp32(*(const ggml_bf16_t *) &p[i]);
-        }
-    } else {
-        const struct ggml_type_traits * tr = ggml_get_type_traits(src->type);
-        if (!tr || !tr->to_float) {
-            fprintf(stderr, "[GGUF] FATAL: unsupported conv weight type %s for '%s'\n", ggml_type_name(src->type),
-                    name.c_str());
-            exit(1);
-        }
-        tr->to_float(raw, f32.data(), (int64_t) n);
-    }
-
-    std::vector<ggml_fp16_t> f16(n);
-    ggml_fp32_to_fp16_row(f32.data(), f16.data(), (int) n);
-    ggml_backend_tensor_set(dst, f16.data(), 0, n * sizeof(ggml_fp16_t));
 }
 
 // Fuse Q, K, V projection weights into a single tensor [ne0, q_ne1 + k_ne1 + v_ne1].

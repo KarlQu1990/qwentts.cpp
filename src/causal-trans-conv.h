@@ -36,12 +36,14 @@ static struct ggml_tensor * qwen_load_ctw_f32(WeightCtx * wctx, const GGUFModel 
         fprintf(stderr, "[CausalTransConv] FATAL: tensor '%s' not found\n", name.c_str());
         exit(1);
     }
-    // Source dtype is F32 in the F32 master, F16 in the quantized variants
-    // since 3D conv weights cannot be Q8_0 / Q4_K_M and ggml falls back to
-    // F16 in the quantizer. Both paths cast to F32 here ; the K*OC*IC
+    // Source dtype follows the GGUF norm (pure llama.cpp policy). The F32
+    // master keeps tensors in F32, the BF16 variant keeps them in their
+    // source BF16, and the K-quant variants land them in F16 through the
+    // aligned fallback (kernel rows of width K=2 do not divide a K-quant
+    // block size). All three are widened to F32 here ; the K*OC*IC
     // permutation always lands in a freshly allocated F32 buffer anyway.
-    if (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) {
-        fprintf(stderr, "[CausalTransConv] FATAL: '%s' expected F32 or F16, got type %d\n", name.c_str(),
+    if (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16 && src->type != GGML_TYPE_BF16) {
+        fprintf(stderr, "[CausalTransConv] FATAL: '%s' expected F32, F16 or BF16, got type %d\n", name.c_str(),
                 (int) src->type);
         exit(1);
     }
@@ -60,7 +62,10 @@ static struct ggml_tensor * qwen_load_ctw_f32(WeightCtx * wctx, const GGUFModel 
         if (src->type == GGML_TYPE_F32) {
             return ((const float *) raw)[idx];
         }
-        return ggml_fp16_to_fp32(((const ggml_fp16_t *) raw)[idx]);
+        if (src->type == GGML_TYPE_F16) {
+            return ggml_fp16_to_fp32(((const ggml_fp16_t *) raw)[idx]);
+        }
+        return ggml_bf16_to_fp32(((const ggml_bf16_t *) raw)[idx]);
     };
 
     for (int ic = 0; ic < IC; ic++) {

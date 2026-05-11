@@ -77,7 +77,7 @@ static bool qwen_upsample_stage_load(QwenUpsampleStage * stage, const GGUFModel 
 
         QwenConvNeXtBlock & cn = stage->convnext[i];
         snprintf(name, sizeof(name), "tok_dec.upsample.%d.dwconv.weight", i);
-        cn.dwconv_w = gf_load_tensor(&wctx, gf, name);
+        cn.dwconv_w = gf_load_conv(&wctx, gf, name);
         snprintf(name, sizeof(name), "tok_dec.upsample.%d.dwconv.bias", i);
         cn.dwconv_b = gf_load_tensor(&wctx, gf, name);
         snprintf(name, sizeof(name), "tok_dec.upsample.%d.norm.weight", i);

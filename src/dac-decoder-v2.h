@@ -150,7 +150,7 @@ static bool qwen_dac_decoder_load(QwenDACDecoder * d, const GGUFModel & gf, ggml
     WeightCtx wctx;
     wctx_init(&wctx, n_tensors);
 
-    d->conv_pre_w = gf_load_tensor(&wctx, gf, "tok_dec.dec.0.conv.weight");
+    d->conv_pre_w = gf_load_conv(&wctx, gf, "tok_dec.dec.0.conv.weight");
     d->conv_pre_b = gf_load_tensor(&wctx, gf, "tok_dec.dec.0.conv.bias");
 
     for (int i = 0; i < QWEN_DAC_NUM_BLOCKS; i++) {
@@ -182,17 +182,17 @@ static bool qwen_dac_decoder_load(QwenDACDecoder * d, const GGUFModel & gf, ggml
 
             qwen_dac_load_snakebeta(&wctx, gf, &ru.act1, std::string(rp) + ".act1.alpha",
                                     std::string(rp) + ".act1.beta");
-            ru.c1w = gf_load_tensor(&wctx, gf, std::string(rp) + ".conv1.weight");
+            ru.c1w = gf_load_conv(&wctx, gf, std::string(rp) + ".conv1.weight");
             ru.c1b = gf_load_tensor(&wctx, gf, std::string(rp) + ".conv1.bias");
             qwen_dac_load_snakebeta(&wctx, gf, &ru.act2, std::string(rp) + ".act2.alpha",
                                     std::string(rp) + ".act2.beta");
-            ru.c2w = gf_load_tensor(&wctx, gf, std::string(rp) + ".conv2.weight");
+            ru.c2w = gf_load_conv(&wctx, gf, std::string(rp) + ".conv2.weight");
             ru.c2b = gf_load_tensor(&wctx, gf, std::string(rp) + ".conv2.bias");
         }
     }
 
     qwen_dac_load_snakebeta(&wctx, gf, &d->snake_post, "tok_dec.dec.5.snake.alpha", "tok_dec.dec.5.snake.beta");
-    d->conv_post_w = gf_load_tensor(&wctx, gf, "tok_dec.dec.6.conv.weight");
+    d->conv_post_w = gf_load_conv(&wctx, gf, "tok_dec.dec.6.conv.weight");
     d->conv_post_b = gf_load_tensor(&wctx, gf, "tok_dec.dec.6.conv.bias");
 
     if (!wctx_alloc(&wctx, backend)) {

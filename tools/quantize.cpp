@@ -106,8 +106,9 @@ static bool is_embed(const char * name) {
 // false here keep their source dtype (F32) regardless of the requested
 // type. Conv weights pass through the main loop and fall back to F16 when
 // the row width does not divide the variant block size (kernel K=7,3,1,...).
-// gf_load_conv_f16 then memcpys F16 source straight to the F16 backend
-// tensor (ARM im2col strict requirement, see src/gguf-weights.h).
+// gf_load_conv then loads every conv kernel as F16 on the backend
+// regardless of the source GGUF dtype, see the TODO upstream block above
+// the function definition in src/gguf-weights.h.
 //
 // Sensitive tensors that MUST stay in full precision :
 //   tok_enc.vq_*.{i}.codebook    RVQ codebook tables, encoder side
@@ -374,8 +375,8 @@ int main(int argc, char ** argv) {
 
         // Conv kernels (K=7,3,1,...) cannot fit a block-quant row : fall back
         // to F16. F16 has no block size, 10-bit mantissa beats BF16 (7) and
-        // Q* effective on these weights, and gf_load_conv_f16 memcpys F16
-        // source straight to the F16 backend tensor at load time.
+        // Q* effective on these weights, and gf_load_conv on the C++ side
+        // loads every conv kernel as F16 regardless of source dtype.
         if (can_convert && !aligned) {
             target  = GGML_TYPE_F16;
             aligned = true;

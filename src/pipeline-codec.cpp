@@ -57,7 +57,7 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
     {
         WeightCtx wctx;
         wctx_init(&wctx, 4);
-        pc->pre_conv_w = gf_load_tensor(&wctx, pc->gguf, "tok_dec.pre_conv.weight");
+        pc->pre_conv_w = gf_load_conv(&wctx, pc->gguf, "tok_dec.pre_conv.weight");
         pc->pre_conv_b = gf_load_tensor(&wctx, pc->gguf, "tok_dec.pre_conv.bias");
         if (!wctx_alloc(&wctx, pc->backend)) {
             qt_log(QT_LOG_ERROR, "[Pipeline] pre_conv backend allocation failed");

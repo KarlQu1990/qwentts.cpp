@@ -30,7 +30,7 @@ static bool qwen_encoder_downsample_load(QwenEncoderDownsample * d, const GGUFMo
 
     WeightCtx wctx;
     wctx_init(&wctx, 4);
-    d->weight = gf_load_tensor(&wctx, gf, "tok_enc.downsample.weight");
+    d->weight = gf_load_conv(&wctx, gf, "tok_enc.downsample.weight");
     if (!wctx_alloc(&wctx, backend)) {
         fprintf(stderr, "[EncDownsample] FATAL: backend allocation failed\n");
         return false;

@@ -107,7 +107,7 @@ static bool qwen_seanet_encoder_load(QwenSEANetEncoder * s, const GGUFModel & gf
     WeightCtx wctx;
     wctx_init(&wctx, n_tensors);
 
-    s->init_w = gf_load_tensor(&wctx, gf, "tok_enc.conv.0.weight");
+    s->init_w = gf_load_conv(&wctx, gf, "tok_enc.conv.0.weight");
     s->init_b = gf_load_tensor(&wctx, gf, "tok_enc.conv.0.bias");
 
     // Stage indexing follows the Python ModuleList layout :
@@ -125,23 +125,23 @@ static bool qwen_seanet_encoder_load(QwenSEANetEncoder * s, const GGUFModel & gf
 
         char name[80];
         snprintf(name, sizeof(name), "tok_enc.res.%d.blk.1.weight", RES_PY_IDX[i]);
-        stg.resnet.c0_w = gf_load_tensor(&wctx, gf, name);
+        stg.resnet.c0_w = gf_load_conv(&wctx, gf, name);
         snprintf(name, sizeof(name), "tok_enc.res.%d.blk.1.bias", RES_PY_IDX[i]);
         stg.resnet.c0_b = gf_load_tensor(&wctx, gf, name);
         snprintf(name, sizeof(name), "tok_enc.res.%d.blk.3.weight", RES_PY_IDX[i]);
-        stg.resnet.c1_w = gf_load_tensor(&wctx, gf, name);
+        stg.resnet.c1_w = gf_load_conv(&wctx, gf, name);
         snprintf(name, sizeof(name), "tok_enc.res.%d.blk.3.bias", RES_PY_IDX[i]);
         stg.resnet.c1_b = gf_load_tensor(&wctx, gf, name);
 
         snprintf(name, sizeof(name), "tok_enc.conv.%d.weight", DOWN_PY_IDX[i]);
-        stg.down_w = gf_load_tensor(&wctx, gf, name);
+        stg.down_w = gf_load_conv(&wctx, gf, name);
         snprintf(name, sizeof(name), "tok_enc.conv.%d.bias", DOWN_PY_IDX[i]);
         stg.down_b = gf_load_tensor(&wctx, gf, name);
 
         dim = stg.out_ch;
     }
 
-    s->last_w = gf_load_tensor(&wctx, gf, "tok_enc.conv.14.weight");
+    s->last_w = gf_load_conv(&wctx, gf, "tok_enc.conv.14.weight");
     s->last_b = gf_load_tensor(&wctx, gf, "tok_enc.conv.14.bias");
 
     if (!wctx_alloc(&wctx, backend)) {
