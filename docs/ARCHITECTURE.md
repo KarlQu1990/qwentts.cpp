@@ -24,8 +24,8 @@ Predictor MTP head that expands each semantic token into the 15
 acoustic codes of that frame. The codes are turned into a waveform by a
 separate audio tokenizer, the Qwen3-TTS-Tokenizer-12Hz (Mimi-style
 SEANet plus a transformer, residual vector quantiser, a ConvNeXt
-upsampler and a DAC v2 decoder), running at 12.5 frames per second over
-24 kHz mono audio.
+upsampler and a DAC decoder, the Descript Audio Codec family), running
+at 12.5 frames per second over 24 kHz mono audio.
 
 Public checkpoints, two talker sizes :
 
@@ -197,7 +197,7 @@ tensors
   tok_dec.pre_conv.*         conv_pre into the decoder transformer
   tok_dec.pre_tfm.input_proj / output_proj / norm + transformer blocks
   tok_dec.upsample.*         ConvNeXt upsample (2 blocks, 4x)
-  tok_dec.<dac>.*            DAC v2 decoder chain
+  tok_dec.<dac>.*            DAC decoder chain
   tok_dec.vq_first.output_proj / vq_rest.output_proj
   tok_{enc,dec}.{vq_*}.<idx>.codebook            RVQ codebook entries
 ```
@@ -304,7 +304,7 @@ codes [T, 16] i32
   -> ConvNeXt upsample : 2 blocks, each CausalTransConv k=2 stride=2 then a
      ConvNeXt block (depthwise causal conv k=7, pointwise 1024 -> 4096 -> 1024,
      LayerScale gamma); together 4x on the time axis at channels 1024
-  -> DAC v2 : conv_pre k=7 (1024 -> 1536), 4 blocks strides 8/5/4/3
+  -> DAC : conv_pre k=7 (1024 -> 1536), 4 blocks strides 8/5/4/3
      channels 1536 -> 768 -> 384 -> 192 -> 96, each block SnakeBeta then
      CausalTransConv then 3 ResUnits (dilations 1/3/9), snake_post,
      conv_post k=7 (96 -> 1)
@@ -357,18 +357,27 @@ text and the reference codes (mode B, ICL).
 ### Modes and the validation rules
 
 The synthesis mode is read from the talker `model_type` at load, not
-from a CLI flag. `qt_synthesize` enforces seven rules and surfaces them
-as `QT_STATUS_MODE_INVALID` or `QT_STATUS_INVALID_PARAMS` with a
-descriptive `qt_last_error()` :
+from a CLI flag. `qt_synthesize` validates the params against that
+`model_type` before any compute and emits a verbatim `qt_last_error()`.
+The checks split across two return codes.
+
+Five conditions mean the flag set does not match the loaded checkpoint
+family, returning `QT_STATUS_MODE_INVALID` :
 
 ```
---speaker  valid only for custom_voice                       MODE_INVALID
---instruct rejected for base                                 MODE_INVALID
-custom_voice requires --speaker                              MODE_INVALID
-voice_design requires a non-empty --instruct                 MODE_INVALID
---ref-wav  valid only for base                               MODE_INVALID
---speaker and --ref-wav are mutually exclusive               INVALID_PARAMS
---ref-text requires --ref-wav                                INVALID_PARAMS
+--speaker  given but model_type != custom_voice
+--instruct given but model_type == base
+model_type == custom_voice but no --speaker
+model_type == voice_design but --instruct empty or missing
+--ref-wav  given but model_type != base
+```
+
+Two conditions mean the flag combination is self-contradictory whatever
+the model_type, returning `QT_STATUS_INVALID_PARAMS` :
+
+```
+--speaker and --ref-wav both given (mutually exclusive)
+--ref-text given without --ref-wav
 ```
 
 ### Frame loop
@@ -568,7 +577,7 @@ src/
   tokenizer-transformer.h   8-layer local-causal decoder transformer (sw 72)
   convnext-block.h          ConvNeXt upsample stage (2 blocks, 4x)
   causal-trans-conv.h       Causal ConvTranspose1d via col2im_1d
-  dac-decoder-v2.h          DAC v2 decoder (strides 8/5/4/3, SnakeBeta)
+  dac-decoder-v2.h          DAC decoder (Descript Audio Codec; strides 8/5/4/3, SnakeBeta)
   codec-chunked-decode.h    Bounded-VRAM decode with rolling left context
 
   prompt-builder.h          Talker prefix assembly, modes, ICL geometry
@@ -686,7 +695,7 @@ exist precisely to bisect that forward path stage by stage.
               strided convs for down/up sampling.
 
   DAC        Descript Audio Codec. Convolutional decoder over the
-              quantised latent. The v2 decoder uses SnakeBeta.
+              quantised latent, here with SnakeBeta activations.
 
   SnakeBeta  Periodic activation `x + (1/beta) * sin^2(alpha*x)` with
               `exp()` applied to alpha and beta, folded at load.
