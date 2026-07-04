@@ -245,6 +245,29 @@ bool pipeline_tts_load(PipelineTTS * pt,
         return false;
     }
 
+    // Persistent graph arenas: one shape class each so the backend CUDA
+    // graph cache keeps a stable executable per flavor across steps.
+    if (!graph_arena_init(&pt->talker_arena, talker_graph_max_nodes(pt->talker.num_hidden_layers)) ||
+        !graph_arena_init(&pt->cp_prefill_arena,
+                          code_predictor_graph_max_nodes(pt->code_predictor.num_hidden_layers)) ||
+        !graph_arena_init(&pt->cp_step_arena, code_predictor_graph_max_nodes(pt->code_predictor.num_hidden_layers))) {
+        graph_arena_free(&pt->talker_arena);
+        graph_arena_free(&pt->cp_prefill_arena);
+        graph_arena_free(&pt->cp_step_arena);
+        kv_cache_free(&pt->code_predictor_kv);
+        kv_cache_free(&pt->talker_kv);
+        ggml_backend_sched_free(pt->sched);
+        pt->sched = NULL;
+        pipeline_codec_free(&pt->codec);
+        if (pt->has_speaker_encoder) {
+            speaker_encoder_weights_free(&pt->speaker_encoder);
+        }
+        code_predictor_weights_free(&pt->code_predictor);
+        talker_weights_free(&pt->talker);
+        gf_close(&pt->gguf_talker);
+        return false;
+    }
+
     qt_log(QT_LOG_INFO,
            "[Pipeline] Loaded: arch=%s variant=%s tokenizer=%s codebooks=%d speaker_encoder=%s speakers=%zu fa=%s "
            "clamp_fp16=%s",
@@ -255,6 +278,9 @@ bool pipeline_tts_load(PipelineTTS * pt,
 }
 
 void pipeline_tts_free(PipelineTTS * pt) {
+    graph_arena_free(&pt->cp_step_arena);
+    graph_arena_free(&pt->cp_prefill_arena);
+    graph_arena_free(&pt->talker_arena);
     kv_cache_free(&pt->code_predictor_kv);
     kv_cache_free(&pt->talker_kv);
     if (pt->sched) {
@@ -579,11 +605,11 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
         bool                ok;
         Timer               t_talker;
         if (step == 0) {
-            ok = talker_forward_prefill(&pt->talker, &pt->talker_kv, pt->sched, prompt.input_embed.data(), prompt.T_ctx,
-                                        use_fa, clamp_fp16, step_dump, &fw);
+            ok = talker_forward_prefill(&pt->talker, &pt->talker_kv, pt->sched, &pt->talker_arena,
+                                        prompt.input_embed.data(), prompt.T_ctx, use_fa, clamp_fp16, step_dump, &fw);
         } else {
-            ok =
-                talker_forward_decode(&pt->talker, &pt->talker_kv, pt->sched, next_emb.data(), use_fa, clamp_fp16, &fw);
+            ok = talker_forward_decode(&pt->talker, &pt->talker_kv, pt->sched, &pt->talker_arena, next_emb.data(),
+                                       use_fa, clamp_fp16, &fw);
         }
         if (!ok) {
             return QT_STATUS_GENERATE_FAILED;
@@ -637,8 +663,9 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
         const char *        cp_dump = (params->dump_dir && step == 0) ? params->dump_dir : NULL;
         Timer               t_pred;
         if (!code_predictor_step(&pt->talker, &pt->code_predictor, &pt->code_predictor_kv, pt->sched,
-                                 fw.hidden_last.data(), c0, subtk_T, params->subtalker_top_k, params->subtalker_top_p,
-                                 resolved_seed, subseq_counter - 1, use_fa, clamp_fp16, cp_dump, &cp)) {
+                                 &pt->cp_prefill_arena, &pt->cp_step_arena, fw.hidden_last.data(), c0, subtk_T,
+                                 params->subtalker_top_k, params->subtalker_top_p, resolved_seed, subseq_counter - 1,
+                                 use_fa, clamp_fp16, cp_dump, &cp)) {
             return QT_STATUS_GENERATE_FAILED;
         }
         perf.predictor_ms += t_pred.ms();

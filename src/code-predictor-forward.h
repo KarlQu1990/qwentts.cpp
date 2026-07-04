@@ -25,15 +25,17 @@
 //   - one private embedding table and one private linear head per
 //     acoustic codebook (1..15)
 //
-// The single-frame loop here recomputes the full graph at every step g
-// (0..14) over a sequence of length g+2. With 5 layers and at most 16
-// tokens per recompute this is sub-millisecond on modern GPUs.
+// Graph metadata lives in two caller owned persistent arenas, one for
+// the T=2 prefill and one for the T=1 steps: each shape class keeps a
+// stable first node address so the CUDA graph cache replays instead of
+// reinstantiating when the two alternate within a frame.
 
 #include "code-predictor-weights.h"
 #include "debug.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "graph-arena.h"
 #include "kv-cache.h"
 #include "qt-error.h"
 #include "sampling.h"
@@ -67,11 +69,17 @@ static struct ggml_tensor * code_predictor_attn_f32(struct ggml_context * ctx,
     return ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
 }
 
+// Node budget for one predictor graph, same accounting as the talker.
+static int code_predictor_graph_max_nodes(int n_layers) {
+    return 48 * n_layers + 64;
+}
+
 // One Qwen3 decoder block, KV cached. K and V for the T fresh positions
 // are written into the cache at [n_past, n_past+T) on dim 1; the
-// attention reads the contiguous slice [0, n_past+T). Returns the layer
-// output [hidden, T]. use_flash_attn and clamp_fp16 follow the same
-// contract as in talker-forward.h.
+// attention reads the fixed [0, n_kv_pad) window with the mask carrying
+// neg inf beyond n_past+T. Returns the layer output [hidden, T].
+// use_flash_attn and clamp_fp16 follow the same contract as in
+// talker-forward.h.
 static struct ggml_tensor * code_predictor_layer_forward(struct ggml_context *        ctx,
                                                          const CodePredictorWeights * cw,
                                                          const TalkerLayer &          layer,
@@ -82,6 +90,7 @@ static struct ggml_tensor * code_predictor_layer_forward(struct ggml_context *  
                                                          struct ggml_tensor *         v_cache,
                                                          int                          n_past,
                                                          int                          T,
+                                                         int                          n_kv_pad,
                                                          bool                         use_flash_attn,
                                                          bool                         clamp_fp16,
                                                          struct ggml_cgraph *         gf) {
@@ -126,9 +135,8 @@ static struct ggml_tensor * code_predictor_layer_forward(struct ggml_context *  
     ggml_build_forward_expand(gf, k_cpy);
     ggml_build_forward_expand(gf, v_cpy);
 
-    const int            T_full = n_past + T;
-    struct ggml_tensor * k_full = ggml_view_3d(ctx, k_cache, hd, T_full, n_kv, k_cache->nb[1], k_cache->nb[2], 0);
-    struct ggml_tensor * v_full = ggml_view_3d(ctx, v_cache, hd, T_full, n_kv, v_cache->nb[1], v_cache->nb[2], 0);
+    struct ggml_tensor * k_full = ggml_view_3d(ctx, k_cache, hd, n_kv_pad, n_kv, k_cache->nb[1], k_cache->nb[2], 0);
+    struct ggml_tensor * v_full = ggml_view_3d(ctx, v_cache, hd, n_kv_pad, n_kv, v_cache->nb[1], v_cache->nb[2], 0);
 
     // Q permute [hd, n_q_heads, T] -> [hd, T, n_q_heads] for flash_attn_ext.
     struct ggml_tensor * q_p = ggml_permute(ctx, q, 0, 2, 1, 3);
@@ -184,6 +192,7 @@ static struct ggml_tensor * code_predictor_layer_forward(struct ggml_context *  
 static bool code_predictor_run(const CodePredictorWeights * cw,
                                KVCache *                    kv,
                                ggml_backend_sched_t         sched,
+                               GraphArena *                 arena,
                                const float *                fresh_input,
                                int                          T,
                                int                          n_past,
@@ -196,20 +205,18 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     const int n_layers = cw->num_hidden_layers;
     const int T_full   = n_past + T;
 
-    const int    max_nodes   = 48 * n_layers + 64;
-    const size_t arena_bytes = ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    // The attention window spans the whole frame cache (16 slots): a
+    // constant width keeps prefill and step graph shapes fixed across
+    // frames so the CUDA graph cache replays each of the two flavors.
+    const int n_kv_pad = kv->max_seq_len;
 
-    struct ggml_init_params gp   = { arena_bytes, NULL, true };
-    struct ggml_context *   gctx = ggml_init(gp);
-    if (!gctx) {
-        fprintf(stderr, "[CodePredictor] FATAL: ggml_init failed\n");
-        return false;
-    }
+    const int             max_nodes = code_predictor_graph_max_nodes(n_layers);
+    struct ggml_context * gctx      = graph_arena_begin(arena);
 
     // Inputs: fresh embeddings (talker_hidden), positions, attention mask
     struct ggml_tensor * x_in    = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, talker_hidden, T);
     struct ggml_tensor * pos_in  = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T);
-    struct ggml_tensor * mask_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, T_full, T);
+    struct ggml_tensor * mask_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, n_kv_pad, T);
     ggml_set_name(x_in, "sub_input");
     ggml_set_name(pos_in, "positions");
     ggml_set_name(mask_in, "causal_mask");
@@ -229,7 +236,7 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
 
     for (int l = 0; l < n_layers; l++) {
         h = code_predictor_layer_forward(gctx, cw, cw->layers[(size_t) l], h, pos_in, mask_in, kv->k[(size_t) l],
-                                         kv->v[(size_t) l], n_past, T, use_flash_attn, clamp_fp16, gf);
+                                         kv->v[(size_t) l], n_past, T, n_kv_pad, use_flash_attn, clamp_fp16, gf);
     }
 
     struct ggml_tensor * h_final = ggml_rms_norm(gctx, h, cw->rms_norm_eps);
@@ -244,7 +251,6 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
         fprintf(stderr, "[CodePredictor] FATAL: graph allocation failed\n");
         ggml_backend_sched_reset(sched);
-        ggml_free(gctx);
         return false;
     }
 
@@ -259,7 +265,7 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     }
 
     {
-        std::vector<ggml_fp16_t> mask((size_t) T * (size_t) T_full);
+        std::vector<ggml_fp16_t> mask((size_t) T * (size_t) n_kv_pad);
         const ggml_fp16_t        zero    = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t        neg_inf = ggml_fp32_to_fp16(-INFINITY);
         for (size_t i = 0; i < mask.size(); i++) {
@@ -268,7 +274,7 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
         for (int q = 0; q < T; q++) {
             const int q_pos = n_past + q;
             for (int k = 0; k <= q_pos; k++) {
-                mask[(size_t) q * (size_t) T_full + (size_t) k] = zero;
+                mask[(size_t) q * (size_t) n_kv_pad + (size_t) k] = zero;
             }
         }
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
@@ -277,7 +283,6 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[CodePredictor] FATAL: graph compute failed\n");
         ggml_backend_sched_reset(sched);
-        ggml_free(gctx);
         return false;
     }
 
@@ -286,9 +291,6 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     ggml_backend_tensor_get(logits, logits_out->data(), (size_t) (T - 1) * row_bytes, row_bytes);
 
     kv->cur_len = T_full;
-
-    ggml_backend_sched_reset(sched);
-    ggml_free(gctx);
     return true;
 }
 
@@ -327,6 +329,8 @@ static bool code_predictor_step(const TalkerWeights *        tw,
                                 const CodePredictorWeights * cw,
                                 KVCache *                    kv,
                                 ggml_backend_sched_t         sched,
+                                GraphArena *                 arena_prefill,
+                                GraphArena *                 arena_step,
                                 const float *                talker_hidden_last,
                                 int                          c0,
                                 float                        temperature,
@@ -361,8 +365,8 @@ static bool code_predictor_step(const TalkerWeights *        tw,
     embed_row_from_backend(tw->codec_embedding, c0, talker_hidden, prefill_input.data() + (size_t) talker_hidden);
 
     std::vector<float> logits;
-    if (!code_predictor_run(cw, kv, sched, prefill_input.data(), 2, 0, talker_hidden, 0, use_flash_attn, clamp_fp16,
-                            &logits)) {
+    if (!code_predictor_run(cw, kv, sched, arena_prefill, prefill_input.data(), 2, 0, talker_hidden, 0, use_flash_attn,
+                            clamp_fp16, &logits)) {
         return false;
     }
     {
@@ -386,8 +390,8 @@ static bool code_predictor_step(const TalkerWeights *        tw,
     for (int g = 1; g < n_acoustic; g++) {
         embed_row_from_backend(cw->codec_embedding[(size_t) (g - 1)], out->codes[(size_t) g], talker_hidden,
                                step_input.data());
-        if (!code_predictor_run(cw, kv, sched, step_input.data(), 1, kv->cur_len, talker_hidden, g, use_flash_attn,
-                                clamp_fp16, &logits)) {
+        if (!code_predictor_run(cw, kv, sched, arena_step, step_input.data(), 1, kv->cur_len, talker_hidden, g,
+                                use_flash_attn, clamp_fp16, &logits)) {
             return false;
         }
         float u_g = 0.0f;

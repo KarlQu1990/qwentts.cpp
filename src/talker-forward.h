@@ -40,6 +40,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "graph-arena.h"
 #include "kv-cache.h"
 #include "talker-weights.h"
 
@@ -73,6 +74,14 @@ static bool talker_is_bisect_layer(int l) {
         }
     }
     return false;
+}
+
+// Node budget for one talker graph. Counts approximate: ~38 ops per
+// layer plus 2 cpy and 4 views for the KV write, IO tensors, final
+// norm, codec_head and bisect dump branches. Sizes both the persistent
+// arena in the pipeline and the graph allocated per forward.
+static int talker_graph_max_nodes(int n_layers) {
+    return 48 * n_layers + 256;
 }
 
 // Manual F32 attention chain. Used when use_flash_attn is false: GQA
@@ -117,6 +126,7 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
                                                  struct ggml_tensor *  v_cache,
                                                  int                   n_past,
                                                  int                   T,
+                                                 int                   n_kv_pad,
                                                  bool                  use_flash_attn,
                                                  bool                  clamp_fp16,
                                                  struct ggml_cgraph *  gf) {
@@ -172,12 +182,15 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
     ggml_build_forward_expand(gf, k_cpy);
     ggml_build_forward_expand(gf, v_cpy);
 
-    // Read the [0, n_past + T) window for attention. The cache slice is
-    // already in the [hd, T_full, n_kv] layout flash_attn_ext expects for
-    // K and V (n_embd, n_kv, n_head_kv, ne3), passed directly as views.
-    const int            T_full = n_past + T;
-    struct ggml_tensor * k_full = ggml_view_3d(ctx, k_cache, hd, T_full, n_kv, k_cache->nb[1], k_cache->nb[2], 0);
-    struct ggml_tensor * v_full = ggml_view_3d(ctx, v_cache, hd, T_full, n_kv, v_cache->nb[1], v_cache->nb[2], 0);
+    // Read the [0, n_kv_pad) window for attention. n_kv_pad covers the
+    // causal context and rounds it up so the view shape stays constant
+    // across consecutive decode steps: the mask carries neg inf beyond
+    // n_past + T and the cache buffer is zero initialized, so the padded
+    // tail contributes nothing. The cache slice is already in the
+    // [hd, n_kv_pad, n_kv] layout flash_attn_ext expects for K and V
+    // (n_embd, n_kv, n_head_kv, ne3), passed directly as views.
+    struct ggml_tensor * k_full = ggml_view_3d(ctx, k_cache, hd, n_kv_pad, n_kv, k_cache->nb[1], k_cache->nb[2], 0);
+    struct ggml_tensor * v_full = ggml_view_3d(ctx, v_cache, hd, n_kv_pad, n_kv, v_cache->nb[1], v_cache->nb[2], 0);
 
     // Q permute [hd, n_q_heads, T] -> [hd, T, n_q_heads]. flash_attn_ext
     // expects ne[1] = n_batch and ne[2] = n_head; the GQA broadcast
@@ -243,10 +256,12 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
 // it and pulls out the last position hidden + logits. T tokens are
 // appended to the cache starting at n_past. When n_past == 0 and
 // dump_dir is set, the bisect taps fire on the prefill path. use_fa /
-// clamp_fp16 are forwarded as is to every layer.
+// clamp_fp16 are forwarded as is to every layer. The graph metadata
+// lives in the caller owned persistent arena.
 static bool talker_forward_core(const TalkerWeights * tw,
                                 KVCache *             kv,
                                 ggml_backend_sched_t  sched,
+                                GraphArena *          arena,
                                 const float *         input_embed,
                                 int                   T,
                                 int                   n_past,
@@ -259,31 +274,24 @@ static bool talker_forward_core(const TalkerWeights * tw,
     const int vocab    = tw->vocab_size;
     const int T_full   = n_past + T;
 
-    // Dedicated context for graph + IO tensors. Counts approximate:
-    //   per layer: ~38 ops (added 2 cpy + 4 views per layer for KV)
-    //   IO        : 4 tensors (input embed, positions, mask, output norm)
-    //   final     : norm + codec_head + dump branches
-    const int    max_nodes         = 48 * n_layers + 256;
-    const size_t graph_arena_bytes = ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    // Attention window rounded up to 256 and clamped to the cache size.
+    // Fixed shapes over spans of 256 decode steps let the CUDA graph
+    // executable update in place (pointer patch) instead of rebuilding.
+    // Ternary instead of std::min: windows.h min/max macros break the
+    // latter in headers on MSVC.
+    const int kv_pad_raw = (int) GGML_PAD(T_full, 256);
+    const int n_kv_pad   = kv_pad_raw < kv->max_seq_len ? kv_pad_raw : kv->max_seq_len;
 
-    struct ggml_init_params gparams = {
-        graph_arena_bytes,
-        NULL,
-        true,
-    };
-    struct ggml_context * gctx = ggml_init(gparams);
-    if (!gctx) {
-        fprintf(stderr, "[TalkerForward] FATAL: ggml_init failed\n");
-        return false;
-    }
+    const int             max_nodes = talker_graph_max_nodes(n_layers);
+    struct ggml_context * gctx      = graph_arena_begin(arena);
 
     // IO tensors: input embedding, positions, causal mask. The mask
-    // spans [T_full, T]: for each fresh query q in [0, T) we allow
-    // keys k in [0, n_past + q]. In the decode case (T=1) this is a
-    // single row of zeros of length T_full.
+    // spans [n_kv_pad, T]: for each fresh query q in [0, T) keys k in
+    // [0, n_past + q] carry 0 and every other slot carries neg inf,
+    // including the padded tail beyond T_full.
     struct ggml_tensor * x_in    = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, hidden, T);
     struct ggml_tensor * pos_in  = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T);
-    struct ggml_tensor * mask_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, T_full, T);
+    struct ggml_tensor * mask_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, n_kv_pad, T);
     ggml_set_name(x_in, "input_embed");
     ggml_set_name(pos_in, "positions");
     ggml_set_name(mask_in, "causal_mask");
@@ -296,7 +304,7 @@ static bool talker_forward_core(const TalkerWeights * tw,
     std::vector<struct ggml_tensor *> taps(TALKER_N_BISECT_LAYERS, NULL);
     for (int l = 0; l < n_layers; l++) {
         h = talker_layer_forward(gctx, tw, tw->layers[(size_t) l], h, pos_in, mask_in, kv->k[(size_t) l],
-                                 kv->v[(size_t) l], n_past, T, use_flash_attn, clamp_fp16, gf);
+                                 kv->v[(size_t) l], n_past, T, n_kv_pad, use_flash_attn, clamp_fp16, gf);
         if (record_taps && talker_is_bisect_layer(l)) {
             for (int i = 0; i < TALKER_N_BISECT_LAYERS; i++) {
                 if (TALKER_BISECT_LAYERS[i] == l) {
@@ -334,7 +342,6 @@ static bool talker_forward_core(const TalkerWeights * tw,
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
         fprintf(stderr, "[TalkerForward] FATAL: graph allocation failed\n");
         ggml_backend_sched_reset(sched);
-        ggml_free(gctx);
         return false;
     }
 
@@ -350,11 +357,12 @@ static bool talker_forward_core(const TalkerWeights * tw,
         ggml_backend_tensor_set(pos_in, pos.data(), 0, (size_t) T * sizeof(int32_t));
     }
 
-    // Causal mask: 0 where k <= n_past + q, -inf otherwise. Stored
-    // row-major [T_q, T_k] with T_k as the fast axis (ne[0]). F16 dtype
-    // matches ggml_flash_attn_ext convention used by the attention path.
+    // Causal mask: 0 where k <= n_past + q, neg inf otherwise. Stored
+    // row major [T_q, n_kv_pad] with n_kv_pad as the fast axis (ne[0]).
+    // F16 dtype matches the ggml_flash_attn_ext convention used by the
+    // attention path.
     {
-        std::vector<ggml_fp16_t> mask((size_t) T * (size_t) T_full);
+        std::vector<ggml_fp16_t> mask((size_t) T * (size_t) n_kv_pad);
         const ggml_fp16_t        zero    = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t        neg_inf = ggml_fp32_to_fp16(-INFINITY);
         for (size_t i = 0; i < mask.size(); i++) {
@@ -363,7 +371,7 @@ static bool talker_forward_core(const TalkerWeights * tw,
         for (int q = 0; q < T; q++) {
             const int q_pos = n_past + q;
             for (int k = 0; k <= q_pos; k++) {
-                mask[(size_t) q * (size_t) T_full + (size_t) k] = zero;
+                mask[(size_t) q * (size_t) n_kv_pad + (size_t) k] = zero;
             }
         }
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
@@ -372,7 +380,6 @@ static bool talker_forward_core(const TalkerWeights * tw,
     if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[TalkerForward] FATAL: graph compute failed\n");
         ggml_backend_sched_reset(sched);
-        ggml_free(gctx);
         return false;
     }
 
@@ -414,11 +421,9 @@ static bool talker_forward_core(const TalkerWeights * tw,
     }
 
     // Advance the cache write head. The graph already executed the cpy
-    // nodes so positions [n_past, n_past + T) are now populated.
+    // nodes so positions [n_past, n_past + T) are now populated. The
+    // arena and the sched allocation persist into the next forward.
     kv->cur_len = T_full;
-
-    ggml_backend_sched_reset(sched);
-    ggml_free(gctx);
     return true;
 }
 
@@ -427,6 +432,7 @@ static bool talker_forward_core(const TalkerWeights * tw,
 static bool talker_forward_prefill(const TalkerWeights * tw,
                                    KVCache *             kv,
                                    ggml_backend_sched_t  sched,
+                                   GraphArena *          arena,
                                    const float *         input_embed,
                                    int                   T,
                                    bool                  use_flash_attn,
@@ -438,7 +444,7 @@ static bool talker_forward_prefill(const TalkerWeights * tw,
         fprintf(stderr, "[TalkerForward] FATAL: prefill T=%d exceeds cache max_seq_len=%d\n", T, kv->max_seq_len);
         return false;
     }
-    return talker_forward_core(tw, kv, sched, input_embed, T, 0, use_flash_attn, clamp_fp16, dump_dir, out);
+    return talker_forward_core(tw, kv, sched, arena, input_embed, T, 0, use_flash_attn, clamp_fp16, dump_dir, out);
 }
 
 // Decode: feed exactly one embedding and append one position to the
@@ -447,6 +453,7 @@ static bool talker_forward_prefill(const TalkerWeights * tw,
 static bool talker_forward_decode(const TalkerWeights * tw,
                                   KVCache *             kv,
                                   ggml_backend_sched_t  sched,
+                                  GraphArena *          arena,
                                   const float *         input_embed_1,
                                   bool                  use_flash_attn,
                                   bool                  clamp_fp16,
@@ -456,5 +463,6 @@ static bool talker_forward_decode(const TalkerWeights * tw,
                 kv->max_seq_len);
         return false;
     }
-    return talker_forward_core(tw, kv, sched, input_embed_1, 1, kv->cur_len, use_flash_attn, clamp_fp16, NULL, out);
+    return talker_forward_core(tw, kv, sched, arena, input_embed_1, 1, kv->cur_len, use_flash_attn, clamp_fp16, NULL,
+                               out);
 }
