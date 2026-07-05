@@ -1,4 +1,4 @@
-[Qwen] qwentts.cpp f84fc05 (2026-07-04)
+[Qwen] qwentts.cpp bcac463 (2026-07-05)
 ggml_cuda_init: found 1 CUDA devices (Total VRAM: 97247 MiB):
   Device 0: NVIDIA RTX PRO 6000 Blackwell Workstation Edition, compute capability 12.0, VMM: yes, VRAM: 97247 MiB
 load_backend: loaded CUDA backend from /mnt/workspace/git/qwentts.cpp/build/libggml-cuda.so
@@ -51,7 +51,7 @@ load_backend: loaded CPU backend from /mnt/workspace/git/qwentts.cpp/build/libgg
 [EncDownsample] Loaded: k=4 stride=2, 512 -> 512 channels, weights 2.0 MB
 [WeightCtx] Loaded 20 tensors, 34.0 MB into backend
 [EncQuantizer] Loaded: 16 codebooks (1 semantic + 15 acoustic), 2048 entries x 256 dim, hidden 512, weights 34.0 MB
-[Pipeline] Codec encoder lazy loaded in 34 ms
+[Pipeline] Codec encoder lazy loaded in 35 ms
 [Debug] audio-input: [412800] first4: -0.000546 -0.001162 -0.000871 0.000340
 [Debug] seanet-out: [430, 512] first4: -0.138303 13.699992 -0.351357 3.025051
 [Debug] enc-transformer-out: [430, 512] first4: 0.526569 3.116264 -0.195330 0.625080
@@ -122,14 +122,14 @@ load_backend: loaded CPU backend from /mnt/workspace/git/qwentts.cpp/build/libgg
 [Pipeline] Generation done : 64 frames
 [Debug] codes-full: [64, 16] first4: 27.000000 1408.000000 1824.000000 400.000000
 [Debug] output-audio: [122880] first4: 0.000673 0.000478 -0.000828 -0.000482
-[Perf] PromptBuild 2.3 ms
-[Perf] Prefill 19.7 ms (T_ctx prefill)
-[Perf] TTFA 31.0 ms (first frame codes)
-[Perf] TalkerDecode 367.9 ms (64 frames, 5.75 ms/frame)
-[Perf] CodePredictor 504.1 ms (7.88 ms/frame)
+[Perf] PromptBuild 9.1 ms
+[Perf] Prefill 19.6 ms (T_ctx prefill)
+[Perf] TTFA 37.9 ms (first frame codes)
+[Perf] TalkerDecode 369.2 ms (64 frames, 5.77 ms/frame)
+[Perf] CodePredictor 512.4 ms (8.01 ms/frame)
 [Perf] HostCompose 0.1 ms (c0 sample + next emb)
-[Perf] CodecDecode 28.8 ms
-[Perf] Total 924.0 ms (64 frames, 13.63 ms/frame AR, audio 5.12 s, RTF 0.180)
+[Perf] CodecDecode 28.9 ms
+[Perf] Total 940.4 ms (64 frames, 13.78 ms/frame AR, audio 5.12 s, RTF 0.184)
 [WAV] Wrote cpp/clone/clone-cpp.wav: 122880 samples, 24000 Hz, mono S16
 [Pipeline] Wrote 122880 samples (5.12 s) -> cpp/clone/clone-cpp.wav
 [Input] Prompt: 100 chars: qwentts.cpp is a minimal C++17 and GGML port of Qwen3-TTS fo...
