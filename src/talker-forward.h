@@ -52,7 +52,9 @@
 #include <vector>
 
 struct TalkerForwardOutput {
-    // Final hidden state for the last position [hidden] f32 (post final norm).
+    // Final hidden state for the last position [hidden] f32 (post final
+    // norm). Filled only when read_hidden_host is set (dump paths); the
+    // hot loop consumes the on device hidden bridge instead.
     std::vector<float> hidden_last;
 
     // Codec head logits for the last position [vocab] f32.
@@ -105,10 +107,11 @@ static struct ggml_tensor * talker_attn_f32(struct ggml_context * ctx,
 }
 
 // Build the per-layer block, KV cached. K and V for the T fresh
-// positions get computed normally, then written into the cache at
-// [n_past, n_past+T) on dim 1. The attention reads the contiguous slice
-// [0, n_past+T) on the same dim, which covers the full causal context
-// in one tensor view. Returns the layer output [hidden, T].
+// positions get computed normally, then written into the cache at the
+// rows carried by kv_rows via set_rows. The attention reads the fixed
+// [0, n_kv_pad) window on the same dim, with the mask killing
+// everything past the causal context. Returns the layer output
+// [hidden, T].
 //
 // use_flash_attn picks between the fused ggml_flash_attn_ext kernel
 // (GPU only, FP16 accumulation guarded with set_prec(F32)) and the
@@ -122,9 +125,9 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
                                                  struct ggml_tensor *  x,
                                                  struct ggml_tensor *  positions,
                                                  struct ggml_tensor *  mask,
+                                                 struct ggml_tensor *  kv_rows,
                                                  struct ggml_tensor *  k_cache,
                                                  struct ggml_tensor *  v_cache,
-                                                 int                   n_past,
                                                  int                   T,
                                                  int                   n_kv_pad,
                                                  bool                  use_flash_attn,
@@ -164,23 +167,18 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
     k = ggml_rope_ext(ctx, k, positions, NULL, hd, GGML_ROPE_TYPE_NEOX, 0, tw->rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
                       0.0f);
 
-    // Write the T fresh positions of K and V into the cache. K and V are
-    // [hd, n_kv, T] at this point and the cache lives as [hd, max_T, n_kv]
-    // so we permute to [hd, T, n_kv] before the cpy. The destination view
-    // covers [hd, T, n_kv] at dim 1 offset n_past * nb1.
+    // Write the T fresh positions of K and V into the cache via
+    // set_rows: kv_rows carries the destination positions as data, so
+    // the graph topology stays identical across decode steps and the
+    // captured CUDA graph replays without an update. K and V are
+    // [hd, n_kv, T] at this point and the cache lives as
+    // [hd, max_T, n_kv] so we permute to [hd, T, n_kv]; the row ids
+    // broadcast across the n_kv head dim.
     struct ggml_tensor * k_perm = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));  // [hd, T, n_kv]
     struct ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));  // [hd, T, n_kv]
 
-    size_t k_off = (size_t) n_past * k_cache->nb[1];
-    size_t v_off = (size_t) n_past * v_cache->nb[1];
-
-    struct ggml_tensor * k_dst = ggml_view_3d(ctx, k_cache, hd, T, n_kv, k_cache->nb[1], k_cache->nb[2], k_off);
-    struct ggml_tensor * v_dst = ggml_view_3d(ctx, v_cache, hd, T, n_kv, v_cache->nb[1], v_cache->nb[2], v_off);
-
-    struct ggml_tensor * k_cpy = ggml_cpy(ctx, k_perm, k_dst);
-    struct ggml_tensor * v_cpy = ggml_cpy(ctx, v_perm, v_dst);
-    ggml_build_forward_expand(gf, k_cpy);
-    ggml_build_forward_expand(gf, v_cpy);
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_cache, k_perm, kv_rows));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_cache, v_perm, kv_rows));
 
     // Read the [0, n_kv_pad) window for attention. n_kv_pad covers the
     // causal context and rounds it up so the view shape stays constant
@@ -253,18 +251,22 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
 }
 
 // Shared core that builds the graph, allocates, uploads inputs, runs
-// it and pulls out the last position hidden + logits. T tokens are
-// appended to the cache starting at n_past. Input is either a raw
-// embedding upload (input_embed, prefill) or the previous frame code
-// ids plus overlay row assembled in graph (frame_ids, decode hot
-// path). When n_past == 0 and dump_dir is set, the bisect taps fire on
-// the prefill path. use_fa / clamp_fp16 are forwarded as is to every
+// it and pulls out the last position logits. T tokens are appended to
+// the cache starting at n_past. Input is either a raw embedding upload
+// (input_embed, prefill) or the previous frame code ids plus overlay
+// row assembled in graph (frame_ids, decode hot path). The last
+// position hidden copies in graph into the caller owned persistent
+// hidden_bridge tensor the code predictor prefill reads on device; the
+// host copy in out->hidden_last fills only under read_hidden_host.
+// When n_past == 0 and dump_dir is set, the bisect taps fire on the
+// prefill path. use_fa / clamp_fp16 are forwarded as is to every
 // layer. The graph metadata lives in the caller owned persistent
 // arena.
 static bool talker_forward_core(const TalkerWeights *        tw,
                                 KVCache *                    kv,
                                 ggml_backend_sched_t         sched,
                                 GraphArena *                 arena,
+                                struct ggml_tensor *         hidden_bridge,
                                 const float *                input_embed,
                                 const int32_t *              frame_ids,
                                 struct ggml_tensor * const * acoustic_embd,
@@ -274,6 +276,7 @@ static bool talker_forward_core(const TalkerWeights *        tw,
                                 int                          n_past,
                                 bool                         use_flash_attn,
                                 bool                         clamp_fp16,
+                                bool                         read_hidden_host,
                                 const char *                 dump_dir,
                                 TalkerForwardOutput *        out) {
     const int hidden   = tw->hidden_size;
@@ -300,6 +303,12 @@ static bool talker_forward_core(const TalkerWeights *        tw,
     struct ggml_tensor * mask_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, n_kv_pad, T);
     ggml_set_name(pos_in, "positions");
     ggml_set_name(mask_in, "causal_mask");
+
+    // KV write positions as data: identical topology at every step,
+    // pure CUDA graph replay across the decode loop.
+    struct ggml_tensor * rows_in = ggml_new_tensor_1d(gctx, GGML_TYPE_I64, T);
+    ggml_set_name(rows_in, "kv_rows");
+    ggml_set_input(rows_in);
 
     // Input: either a raw embedding upload (prefill path) or, on the
     // decode hot path, the frame codes of the previous step gathered
@@ -337,8 +346,8 @@ static bool talker_forward_core(const TalkerWeights *        tw,
     struct ggml_tensor *              h           = x_in;
     std::vector<struct ggml_tensor *> taps(TALKER_N_BISECT_LAYERS, NULL);
     for (int l = 0; l < n_layers; l++) {
-        h = talker_layer_forward(gctx, tw, tw->layers[(size_t) l], h, pos_in, mask_in, kv->k[(size_t) l],
-                                 kv->v[(size_t) l], n_past, T, n_kv_pad, use_flash_attn, clamp_fp16, gf);
+        h = talker_layer_forward(gctx, tw, tw->layers[(size_t) l], h, pos_in, mask_in, rows_in, kv->k[(size_t) l],
+                                 kv->v[(size_t) l], T, n_kv_pad, use_flash_attn, clamp_fp16, gf);
         if (record_taps && talker_is_bisect_layer(l)) {
             for (int i = 0; i < TALKER_N_BISECT_LAYERS; i++) {
                 if (TALKER_BISECT_LAYERS[i] == l) {
@@ -356,7 +365,16 @@ static bool talker_forward_core(const TalkerWeights *        tw,
     struct ggml_tensor * h_final = ggml_rms_norm(gctx, h, tw->rms_norm_eps);
     h_final                      = ggml_mul(gctx, h_final, tw->norm_w);
     ggml_set_name(h_final, "hidden_final");
-    ggml_set_output(h_final);
+    if (record_taps || read_hidden_host) {
+        ggml_set_output(h_final);
+    }
+
+    // Bridge: the last position hidden copies on device into the
+    // persistent tensor. Constant destination address across steps, so
+    // the decode graph topology stays replayable.
+    struct ggml_tensor * h_last =
+        ggml_view_1d(gctx, h_final, hidden, (size_t) (T - 1) * (size_t) hidden * sizeof(float));
+    struct ggml_tensor * bridge_cpy = ggml_cpy(gctx, h_last, hidden_bridge);
 
     // codec_head: [hidden, vocab]. ggml_mul_mat returns [vocab, T].
     struct ggml_tensor * logits = ggml_mul_mat(gctx, tw->codec_head_w, h_final);
@@ -371,6 +389,7 @@ static bool talker_forward_core(const TalkerWeights *        tw,
         ggml_build_forward_expand(gf, h_final);
     }
     ggml_build_forward_expand(gf, logits);
+    ggml_build_forward_expand(gf, bridge_cpy);
 
     ggml_backend_sched_reset(sched);
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
@@ -394,6 +413,12 @@ static bool talker_forward_core(const TalkerWeights *        tw,
             pos[(size_t) i] = n_past + i;
         }
         ggml_backend_tensor_set(pos_in, pos.data(), 0, (size_t) T * sizeof(int32_t));
+
+        std::vector<int64_t> rows((size_t) T);
+        for (int i = 0; i < T; i++) {
+            rows[(size_t) i] = (int64_t) (n_past + i);
+        }
+        ggml_backend_tensor_set(rows_in, rows.data(), 0, (size_t) T * sizeof(int64_t));
     }
 
     // Causal mask: 0 where k <= n_past + q, neg inf otherwise. Stored
@@ -440,15 +465,17 @@ static bool talker_forward_core(const TalkerWeights *        tw,
         debug_dump_2d(&d, "talker-hidden-prefill-final", buf.data(), T, hidden);
     }
 
-    // Pull the last position: final hidden + logits
+    // Pull the last position logits, the only per step readback on the
+    // hot path. The hidden row comes back to host only for dumps.
     out->hidden = hidden;
     out->vocab  = vocab;
-    out->hidden_last.assign((size_t) hidden, 0.0f);
     out->logits_last.assign((size_t) vocab, 0.0f);
     {
         size_t row_bytes = (size_t) vocab * sizeof(float);
         ggml_backend_tensor_get(logits, out->logits_last.data(), (size_t) (T - 1) * row_bytes, row_bytes);
-
+    }
+    if (read_hidden_host) {
+        out->hidden_last.assign((size_t) hidden, 0.0f);
         size_t hrow_bytes = (size_t) hidden * sizeof(float);
         ggml_backend_tensor_get(h_final, out->hidden_last.data(), (size_t) (T - 1) * hrow_bytes, hrow_bytes);
     }
@@ -472,6 +499,7 @@ static bool talker_forward_prefill(const TalkerWeights * tw,
                                    KVCache *             kv,
                                    ggml_backend_sched_t  sched,
                                    GraphArena *          arena,
+                                   struct ggml_tensor *  hidden_bridge,
                                    const float *         input_embed,
                                    int                   T,
                                    bool                  use_flash_attn,
@@ -483,8 +511,8 @@ static bool talker_forward_prefill(const TalkerWeights * tw,
         fprintf(stderr, "[TalkerForward] FATAL: prefill T=%d exceeds cache max_seq_len=%d\n", T, kv->max_seq_len);
         return false;
     }
-    return talker_forward_core(tw, kv, sched, arena, input_embed, NULL, NULL, 0, NULL, T, 0, use_flash_attn, clamp_fp16,
-                               dump_dir, out);
+    return talker_forward_core(tw, kv, sched, arena, hidden_bridge, input_embed, NULL, NULL, 0, NULL, T, 0,
+                               use_flash_attn, clamp_fp16, dump_dir != NULL, dump_dir, out);
 }
 
 // Decode: feed exactly one embedding and append one position to the
@@ -498,18 +526,20 @@ static bool talker_forward_decode(const TalkerWeights *        tw,
                                   KVCache *                    kv,
                                   ggml_backend_sched_t         sched,
                                   GraphArena *                 arena,
+                                  struct ggml_tensor *         hidden_bridge,
                                   const int32_t *              frame_ids,
                                   struct ggml_tensor * const * acoustic_embd,
                                   int                          n_acoustic,
                                   const float *                overlay,
                                   bool                         use_flash_attn,
                                   bool                         clamp_fp16,
+                                  bool                         read_hidden_host,
                                   TalkerForwardOutput *        out) {
     if (kv->cur_len + 1 > kv->max_seq_len) {
         fprintf(stderr, "[TalkerForward] FATAL: decode would overflow cache (%d + 1 > %d)\n", kv->cur_len,
                 kv->max_seq_len);
         return false;
     }
-    return talker_forward_core(tw, kv, sched, arena, NULL, frame_ids, acoustic_embd, n_acoustic, overlay, 1,
-                               kv->cur_len, use_flash_attn, clamp_fp16, NULL, out);
+    return talker_forward_core(tw, kv, sched, arena, hidden_bridge, NULL, frame_ids, acoustic_embd, n_acoustic, overlay,
+                               1, kv->cur_len, use_flash_attn, clamp_fp16, read_hidden_host, NULL, out);
 }

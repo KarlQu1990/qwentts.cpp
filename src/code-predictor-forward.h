@@ -4,8 +4,11 @@
 // KV cached.
 //
 // Input:
-//   talker_hidden_last [hidden] f32   -- last position hidden state from
-//                                        the Talker forward (post final norm)
+//   hidden_bridge [hidden] f32        -- persistent backend tensor holding
+//                                        the talker last position hidden
+//                                        (post final norm), written on
+//                                        device by the talker graph and
+//                                        read here as a graph leaf
 //   c0                                -- semantic code sampled from the
 //                                        Talker codec_head (codebook 0)
 // Output:
@@ -86,9 +89,9 @@ static struct ggml_tensor * code_predictor_layer_forward(struct ggml_context *  
                                                          struct ggml_tensor *         x,
                                                          struct ggml_tensor *         positions,
                                                          struct ggml_tensor *         mask,
+                                                         struct ggml_tensor *         kv_rows,
                                                          struct ggml_tensor *         k_cache,
                                                          struct ggml_tensor *         v_cache,
-                                                         int                          n_past,
                                                          int                          T,
                                                          int                          n_kv_pad,
                                                          bool                         use_flash_attn,
@@ -120,20 +123,14 @@ static struct ggml_tensor * code_predictor_layer_forward(struct ggml_context *  
     k = ggml_rope_ext(ctx, k, positions, NULL, hd, GGML_ROPE_TYPE_NEOX, 0, cw->rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
                       0.0f);
 
-    // Write the fresh positions into the cache.
+    // Write the fresh positions into the cache via set_rows: positions
+    // travel as data so every step keeps an identical topology and the
+    // captured CUDA graph replays without an update.
     struct ggml_tensor * k_perm = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));  // [hd, T, n_kv]
     struct ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
 
-    size_t k_off = (size_t) n_past * k_cache->nb[1];
-    size_t v_off = (size_t) n_past * v_cache->nb[1];
-
-    struct ggml_tensor * k_dst = ggml_view_3d(ctx, k_cache, hd, T, n_kv, k_cache->nb[1], k_cache->nb[2], k_off);
-    struct ggml_tensor * v_dst = ggml_view_3d(ctx, v_cache, hd, T, n_kv, v_cache->nb[1], v_cache->nb[2], v_off);
-
-    struct ggml_tensor * k_cpy = ggml_cpy(ctx, k_perm, k_dst);
-    struct ggml_tensor * v_cpy = ggml_cpy(ctx, v_perm, v_dst);
-    ggml_build_forward_expand(gf, k_cpy);
-    ggml_build_forward_expand(gf, v_cpy);
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_cache, k_perm, kv_rows));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_cache, v_perm, kv_rows));
 
     struct ggml_tensor * k_full = ggml_view_3d(ctx, k_cache, hd, n_kv_pad, n_kv, k_cache->nb[1], k_cache->nb[2], 0);
     struct ggml_tensor * v_full = ggml_view_3d(ctx, v_cache, hd, n_kv_pad, n_kv, v_cache->nb[1], v_cache->nb[2], 0);
@@ -194,11 +191,10 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
                                ggml_backend_sched_t         sched,
                                GraphArena *                 arena,
                                struct ggml_tensor *         embd_table,
-                               const float *                hidden_row,
+                               struct ggml_tensor *         hidden_bridge,
                                int32_t                      code_id,
                                int                          T,
                                int                          n_past,
-                               int                          talker_hidden,
                                int                          g_head,
                                bool                         use_flash_attn,
                                bool                         clamp_fp16,
@@ -216,25 +212,25 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     struct ggml_context * gctx      = graph_arena_begin(arena);
 
     // Inputs: one code id gathered in graph from embd_table, positions,
-    // attention mask, plus the raw talker hidden row on the prefill
-    // path (T == 2, hidden_row non NULL) where the sequence is
-    // [talker_hidden, embed(c0)]. Steps (T == 1) are pure gathers: the
-    // only per step upload is 4 bytes of code id.
+    // attention mask. The prefill path (T == 2, hidden_bridge non NULL)
+    // concats the resident talker hidden ahead of embed(c0), both on
+    // device: the sequence is [talker_hidden, embed(c0)] with zero row
+    // upload. Steps (T == 1) are pure gathers: the only per step upload
+    // is 4 bytes of code id.
     struct ggml_tensor * ids_in  = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
     struct ggml_tensor * pos_in  = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T);
     struct ggml_tensor * mask_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, n_kv_pad, T);
+    struct ggml_tensor * rows_in = ggml_new_tensor_1d(gctx, GGML_TYPE_I64, T);
     ggml_set_name(ids_in, "sub_code_id");
     ggml_set_name(pos_in, "positions");
     ggml_set_name(mask_in, "causal_mask");
+    ggml_set_name(rows_in, "kv_rows");
     ggml_set_input(ids_in);
+    ggml_set_input(rows_in);
 
-    struct ggml_tensor * x_in   = ggml_get_rows(gctx, embd_table, ids_in);
-    struct ggml_tensor * hid_in = NULL;
+    struct ggml_tensor * x_in = ggml_get_rows(gctx, embd_table, ids_in);
     if (T == 2) {
-        hid_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, talker_hidden, 1);
-        ggml_set_name(hid_in, "talker_hidden_row");
-        ggml_set_input(hid_in);
-        x_in = ggml_concat(gctx, hid_in, x_in, 1);
+        x_in = ggml_concat(gctx, hidden_bridge, x_in, 1);
     }
     ggml_set_name(x_in, "sub_input");
 
@@ -252,8 +248,9 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     }
 
     for (int l = 0; l < n_layers; l++) {
-        h = code_predictor_layer_forward(gctx, cw, cw->layers[(size_t) l], h, pos_in, mask_in, kv->k[(size_t) l],
-                                         kv->v[(size_t) l], n_past, T, n_kv_pad, use_flash_attn, clamp_fp16, gf);
+        h = code_predictor_layer_forward(gctx, cw, cw->layers[(size_t) l], h, pos_in, mask_in, rows_in,
+                                         kv->k[(size_t) l], kv->v[(size_t) l], T, n_kv_pad, use_flash_attn, clamp_fp16,
+                                         gf);
     }
 
     struct ggml_tensor * h_final = ggml_rms_norm(gctx, h, cw->rms_norm_eps);
@@ -272,9 +269,6 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     }
 
     ggml_backend_tensor_set(ids_in, &code_id, 0, sizeof(int32_t));
-    if (hid_in) {
-        ggml_backend_tensor_set(hid_in, hidden_row, 0, (size_t) talker_hidden * sizeof(float));
-    }
 
     {
         std::vector<int32_t> pos((size_t) T);
@@ -282,6 +276,12 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
             pos[(size_t) i] = n_past + i;
         }
         ggml_backend_tensor_set(pos_in, pos.data(), 0, (size_t) T * sizeof(int32_t));
+
+        std::vector<int64_t> rows((size_t) T);
+        for (int i = 0; i < T; i++) {
+            rows[(size_t) i] = (int64_t) (n_past + i);
+        }
+        ggml_backend_tensor_set(rows_in, rows.data(), 0, (size_t) T * sizeof(int64_t));
     }
 
     {
@@ -314,20 +314,21 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     return true;
 }
 
-// Run the predictor for one audio frame. Caller passes the talker hidden
-// state for the current frame and the already-sampled c0. Sampling
-// parameters control greedy (temperature <= 0) vs stochastic. subseq_base
-// is the Philox subsequence of the c0 sample for this step; the 15
-// acoustic samples consume subseq_base + 1 .. subseq_base + 15.
-// Returns the full vector of 16 codes. dump_dir may be NULL.
-// use_flash_attn / clamp_fp16 are forwarded as is to every internal run.
+// Run the predictor for one audio frame. Caller passes the persistent
+// hidden bridge holding the talker hidden for the current frame and the
+// already-sampled c0. Sampling parameters control greedy
+// (temperature <= 0) vs stochastic. subseq_base is the Philox
+// subsequence of the c0 sample for this step; the 15 acoustic samples
+// consume subseq_base + 1 .. subseq_base + 15. Returns the full vector
+// of 16 codes. dump_dir may be NULL. use_flash_attn / clamp_fp16 are
+// forwarded as is to every internal run.
 static bool code_predictor_step(const TalkerWeights *        tw,
                                 const CodePredictorWeights * cw,
                                 KVCache *                    kv,
                                 ggml_backend_sched_t         sched,
                                 GraphArena *                 arena_prefill,
-                                GraphArena *                 arena_step,
-                                const float *                talker_hidden_last,
+                                GraphArena *                 arenas_step,
+                                struct ggml_tensor *         hidden_bridge,
                                 int                          c0,
                                 float                        temperature,
                                 int                          top_k,
@@ -339,11 +340,10 @@ static bool code_predictor_step(const TalkerWeights *        tw,
                                 const char *                 dump_dir,
                                 CodePredictorOutput *        out) {
     // sub_input slots live at the talker hidden dimension: both the
-    // talker last hidden and the codec_embedding rows feeding the sub
-    // network are talker sized in the upstream checkpoint. The graph's
-    // mtp_proj brings them down to predictor hidden when present.
-    const int talker_hidden = tw->hidden_size;
-    const int n_acoustic    = cw->num_acoustic_codebooks;
+    // bridge row and the codec_embedding rows feeding the sub network
+    // are talker sized in the upstream checkpoint. The graph's mtp_proj
+    // brings them down to predictor hidden when present.
+    const int n_acoustic = cw->num_acoustic_codebooks;
 
     if (n_acoustic + 1 > kv->max_seq_len) {
         fprintf(stderr, "[CodePredictor] FATAL: frame width %d exceeds cache max_seq_len %d\n", n_acoustic + 1,
@@ -354,14 +354,14 @@ static bool code_predictor_step(const TalkerWeights *        tw,
     out->codes.assign((size_t) (n_acoustic + 1), 0);
     out->codes[0] = c0;
 
-    // Prefill: two positions, [talker_hidden_last, embed_talker(c0)].
-    // The hidden row uploads raw, c0 gathers in graph from the talker
-    // codec embedding table.
+    // Prefill: two positions, [talker_hidden, embed_talker(c0)], both
+    // resident on device: the hidden reads from the bridge, c0 gathers
+    // in graph from the talker codec embedding table.
     kv_cache_reset(kv);
 
     std::vector<float> logits;
-    if (!code_predictor_run(cw, kv, sched, arena_prefill, tw->codec_embedding, talker_hidden_last, c0, 2, 0,
-                            talker_hidden, 0, use_flash_attn, clamp_fp16, &logits)) {
+    if (!code_predictor_run(cw, kv, sched, arena_prefill, tw->codec_embedding, hidden_bridge, c0, 2, 0, 0,
+                            use_flash_attn, clamp_fp16, &logits)) {
         return false;
     }
     {
@@ -381,11 +381,11 @@ static bool code_predictor_step(const TalkerWeights *        tw,
 
     // Decode loop: 14 single-token steps. At step g (g=1..14) we feed
     // the id of the code we just sampled, gathered in graph from the
-    // group's private embedding table, and read lm_head[g].
+    // group's private embedding table, and read lm_head[g]. Each step
+    // owns its arena so lm_head and the table stay fixed per graph.
     for (int g = 1; g < n_acoustic; g++) {
-        if (!code_predictor_run(cw, kv, sched, arena_step, cw->codec_embedding[(size_t) (g - 1)], NULL,
-                                out->codes[(size_t) g], 1, kv->cur_len, talker_hidden, g, use_flash_attn, clamp_fp16,
-                                &logits)) {
+        if (!code_predictor_run(cw, kv, sched, &arenas_step[(size_t) (g - 1)], cw->codec_embedding[(size_t) (g - 1)],
+                                NULL, out->codes[(size_t) g], 1, kv->cur_len, g, use_flash_attn, clamp_fp16, &logits)) {
             return false;
         }
         float u_g = 0.0f;

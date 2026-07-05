@@ -132,14 +132,23 @@ struct PipelineTTS {
     KVCache talker_kv;
     KVCache code_predictor_kv;
 
+    // Hidden bridge: the talker last position hidden stays resident on
+    // device. The talker graph copies it in, the code predictor prefill
+    // graph reads it as a leaf, so the AR hot loop never round trips
+    // the row through the host. [talker_hidden] f32 on `backend`.
+    struct ggml_context * bridge_ctx;
+    ggml_backend_buffer_t bridge_buf;
+    struct ggml_tensor *  hidden_bridge;
+
     // Persistent graph arenas, one per graph shape class. Stable node
     // addresses across rebuilds keep the backend CUDA graph cache hot:
     // the talker shares one arena for prefill and decode, the predictor
-    // splits prefill (T=2) and step (T=1) so the two flavors that
-    // alternate within a frame each keep their own executable.
-    GraphArena talker_arena;
-    GraphArena cp_prefill_arena;
-    GraphArena cp_step_arena;
+    // splits prefill (T=2) from the steps, with one arena per sub step
+    // g so each graph keeps a fixed lm_head and embedding table and the
+    // captured executable replays without an update.
+    GraphArena              talker_arena;
+    GraphArena              cp_prefill_arena;
+    std::vector<GraphArena> cp_step_arenas;
 };
 
 // Open the talker GGUF and the codec GGUF, load every module on the

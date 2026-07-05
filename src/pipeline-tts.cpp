@@ -115,6 +115,9 @@ bool pipeline_tts_load(PipelineTTS * pt,
     pt->backend             = bp.backend;
     pt->sched               = NULL;
     pt->has_speaker_encoder = false;
+    pt->bridge_ctx          = NULL;
+    pt->bridge_buf          = NULL;
+    pt->hidden_bridge       = NULL;
 
     // Fused flash attention needs a GPU kernel; CPU only backends fall
     // back to the F32 manual chain automatically. clamp_fp16 is forwarded
@@ -224,15 +227,63 @@ bool pipeline_tts_load(PipelineTTS * pt,
         return false;
     }
 
+    // Hidden bridge: one [talker_hidden] f32 tensor resident on the
+    // backend, written by the talker graph and read by the code
+    // predictor prefill graph. Cleared once so debug dumps never see
+    // stale bytes before the first talker forward.
+    {
+        struct ggml_init_params gp = { ggml_tensor_overhead() * 2, NULL, true };
+        pt->bridge_ctx             = ggml_init(gp);
+        pt->hidden_bridge =
+            pt->bridge_ctx ? ggml_new_tensor_1d(pt->bridge_ctx, GGML_TYPE_F32, pt->talker.hidden_size) : NULL;
+        if (pt->hidden_bridge) {
+            ggml_set_name(pt->hidden_bridge, "talker_hidden_bridge");
+            pt->bridge_buf = ggml_backend_alloc_ctx_tensors(pt->bridge_ctx, pt->backend);
+        }
+        if (!pt->hidden_bridge || !pt->bridge_buf) {
+            qt_log(QT_LOG_ERROR, "[Pipeline] hidden bridge allocation failed");
+            if (pt->bridge_ctx) {
+                ggml_free(pt->bridge_ctx);
+                pt->bridge_ctx = NULL;
+            }
+            pt->hidden_bridge = NULL;
+            kv_cache_free(&pt->code_predictor_kv);
+            kv_cache_free(&pt->talker_kv);
+            ggml_backend_sched_free(pt->sched);
+            pt->sched = NULL;
+            pipeline_codec_free(&pt->codec);
+            code_predictor_weights_free(&pt->code_predictor);
+            talker_weights_free(&pt->talker);
+            gf_close(&pt->gguf_talker);
+            return false;
+        }
+        ggml_backend_buffer_clear(pt->bridge_buf, 0);
+    }
+
     // Persistent graph arenas: one shape class each so the backend CUDA
     // graph cache keeps a stable executable per flavor across steps.
-    if (!graph_arena_init(&pt->talker_arena, talker_graph_max_nodes(pt->talker.num_hidden_layers)) ||
-        !graph_arena_init(&pt->cp_prefill_arena,
-                          code_predictor_graph_max_nodes(pt->code_predictor.num_hidden_layers)) ||
-        !graph_arena_init(&pt->cp_step_arena, code_predictor_graph_max_nodes(pt->code_predictor.num_hidden_layers))) {
+    // The predictor gets one arena per sub step g: each of the 14 step
+    // graphs then keeps a fixed lm_head and embedding table and replays
+    // its captured executable without an update.
+    bool arenas_ok =
+        graph_arena_init(&pt->talker_arena, talker_graph_max_nodes(pt->talker.num_hidden_layers)) &&
+        graph_arena_init(&pt->cp_prefill_arena, code_predictor_graph_max_nodes(pt->code_predictor.num_hidden_layers));
+    pt->cp_step_arenas.resize((size_t) (pt->num_code_groups - 2));
+    for (size_t g = 0; arenas_ok && g < pt->cp_step_arenas.size(); g++) {
+        arenas_ok = graph_arena_init(&pt->cp_step_arenas[g],
+                                     code_predictor_graph_max_nodes(pt->code_predictor.num_hidden_layers));
+    }
+    if (!arenas_ok) {
+        for (size_t g = 0; g < pt->cp_step_arenas.size(); g++) {
+            graph_arena_free(&pt->cp_step_arenas[g]);
+        }
         graph_arena_free(&pt->talker_arena);
         graph_arena_free(&pt->cp_prefill_arena);
-        graph_arena_free(&pt->cp_step_arena);
+        ggml_backend_buffer_free(pt->bridge_buf);
+        pt->bridge_buf = NULL;
+        ggml_free(pt->bridge_ctx);
+        pt->bridge_ctx    = NULL;
+        pt->hidden_bridge = NULL;
         kv_cache_free(&pt->code_predictor_kv);
         kv_cache_free(&pt->talker_kv);
         ggml_backend_sched_free(pt->sched);
@@ -254,9 +305,21 @@ bool pipeline_tts_load(PipelineTTS * pt,
 }
 
 void pipeline_tts_free(PipelineTTS * pt) {
-    graph_arena_free(&pt->cp_step_arena);
+    for (size_t g = 0; g < pt->cp_step_arenas.size(); g++) {
+        graph_arena_free(&pt->cp_step_arenas[g]);
+    }
+    pt->cp_step_arenas.clear();
     graph_arena_free(&pt->cp_prefill_arena);
     graph_arena_free(&pt->talker_arena);
+    if (pt->bridge_buf) {
+        ggml_backend_buffer_free(pt->bridge_buf);
+        pt->bridge_buf = NULL;
+    }
+    if (pt->bridge_ctx) {
+        ggml_free(pt->bridge_ctx);
+        pt->bridge_ctx = NULL;
+    }
+    pt->hidden_bridge = NULL;
     kv_cache_free(&pt->code_predictor_kv);
     kv_cache_free(&pt->talker_kv);
     if (pt->sched) {
@@ -604,13 +667,13 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
         bool                ok;
         Timer               t_talker;
         if (step == 0) {
-            ok = talker_forward_prefill(&pt->talker, &pt->talker_kv, pt->sched, &pt->talker_arena,
+            ok = talker_forward_prefill(&pt->talker, &pt->talker_kv, pt->sched, &pt->talker_arena, pt->hidden_bridge,
                                         prompt.input_embed.data(), prompt.T_ctx, use_fa, clamp_fp16, step_dump, &fw);
         } else {
-            ok =
-                talker_forward_decode(&pt->talker, &pt->talker_kv, pt->sched, &pt->talker_arena, prev_ids.data(),
-                                      pt->code_predictor.codec_embedding.data(),
-                                      pt->code_predictor.num_acoustic_codebooks, prev_overlay, use_fa, clamp_fp16, &fw);
+            ok = talker_forward_decode(&pt->talker, &pt->talker_kv, pt->sched, &pt->talker_arena, pt->hidden_bridge,
+                                       prev_ids.data(), pt->code_predictor.codec_embedding.data(),
+                                       pt->code_predictor.num_acoustic_codebooks, prev_overlay, use_fa, clamp_fp16,
+                                       params->dump_dir != NULL, &fw);
         }
         if (!ok) {
             return QT_STATUS_GENERATE_FAILED;
@@ -664,7 +727,7 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
         const char *        cp_dump = (params->dump_dir && step == 0) ? params->dump_dir : NULL;
         Timer               t_pred;
         if (!code_predictor_step(&pt->talker, &pt->code_predictor, &pt->code_predictor_kv, pt->sched,
-                                 &pt->cp_prefill_arena, &pt->cp_step_arena, fw.hidden_last.data(), c0, subtk_T,
+                                 &pt->cp_prefill_arena, pt->cp_step_arenas.data(), pt->hidden_bridge, c0, subtk_T,
                                  params->subtalker_top_k, params->subtalker_top_p, resolved_seed, subseq_counter - 1,
                                  use_fa, clamp_fp16, cp_dump, &cp)) {
             return QT_STATUS_GENERATE_FAILED;
