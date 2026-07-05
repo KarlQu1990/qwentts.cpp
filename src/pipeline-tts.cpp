@@ -609,13 +609,13 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
     const float subtk_T       = params->subtalker_do_sample ? params->subtalker_temperature : 0.0f;
     const float talker_rp     = params->repetition_penalty;
 
-    // Codec decode framing. Both the streaming path and the buffered
-    // path route through codec_chunked_decode, with a rolling left
-    // context window that mirrors the upstream Qwen3-TTS 12 Hz tokenizer
-    // chunked_decode rule : every chunk re uses up to left_ctx_frames
-    // previously decoded frames as left context, then the matching audio
-    // samples are stripped from the head of the decoded chunk. The first
-    // chunk has its left context collapsed to whatever is available.
+    // Codec decode framing. The buffered path routes through
+    // codec_chunked_decode with a rolling left context window mirroring
+    // the upstream Qwen3-TTS 12 Hz tokenizer chunked_decode rule: every
+    // chunk re uses up to left_ctx_frames previously decoded frames as
+    // left context, then the matching audio samples are stripped from
+    // the head of the decoded chunk. The streaming path decodes frame
+    // by frame through the stateful codec and ignores both knobs.
     const bool  streaming       = (params->on_chunk != NULL);
     const float chunk_sec       = params->codec_chunk_sec > 0.0f ? params->codec_chunk_sec : 24.0f;
     const float left_ctx_sec    = params->codec_left_context_sec >= 0.0f ? params->codec_left_context_sec : 2.0f;
@@ -639,17 +639,24 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
     std::vector<int32_t> prev_ids((size_t) num_codebooks, 0);
     const float *        prev_overlay = NULL;
 
-    // Streaming rolling decoder. Holds the K major codes buffer, the
-    // emit cursor and the left context window. push_frame triggers an
-    // emit as soon as chunk_frames new frames have accumulated since
-    // the previous emit boundary ; flush drains the tail at EOS.
-    codec_chunked_decoder_stream stream;
+    // Stateful streaming decoder: every generated frame decodes
+    // immediately through the persistent codec state and emits its
+    // samples, so the first audio callback fires with the first frame.
+    // ICL clone priming runs the full reference through the same state,
+    // matching the upstream reference plus generated decode exactly.
+    codec_stream_decoder stream;
     if (streaming) {
-        stream.init(num_codebooks, chunk_frames, left_ctx_frames);
-        // ICL clone: the reference tail seeds the decoder left context
-        // so the onset is voiced with the reference's causal state.
+        if (!stream.init(&pt->codec, num_codebooks)) {
+            qt_set_error("pipeline_tts_synthesize: codec stream state init failed");
+            return QT_STATUS_GENERATE_FAILED;
+        }
         if (ref_codes_ptr != NULL) {
-            stream.seed_reference(ref_codes_ptr, ref_codes_T);
+            Timer t_seed;
+            if (!stream.seed_reference(&pt->codec, ref_codes_ptr, ref_codes_T)) {
+                qt_set_error("pipeline_tts_synthesize: codec stream reference priming failed");
+                return QT_STATUS_GENERATE_FAILED;
+            }
+            perf.codec_ms += t_seed.ms();
         }
     }
 
@@ -819,22 +826,10 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
         debug_dump_i32_as_f32(&d, "codes-full", flat.data(), shape, 2);
     }
 
-    // Streaming tail: flush remaining frames through the callback. The
-    // buffered output stays empty in this branch; the caller already
-    // received every sample through on_chunk.
+    // Streaming tail: nothing to drain, every frame already emitted at
+    // generation time through the stateful decoder. The buffered output
+    // stays empty in this branch.
     if (streaming) {
-        Timer t_flush;
-        bool  flushed = stream.flush(&pt->codec, params->on_chunk, params->on_chunk_user_data);
-        perf.codec_ms += t_flush.ms();
-        if (!flushed) {
-            if (stream.cancelled) {
-                qt_log(QT_LOG_INFO, "[Pipeline] on_chunk callback aborted the synthesis on tail flush");
-                return QT_STATUS_CANCELLED;
-            }
-            qt_set_error("pipeline_tts_synthesize: streaming codec decode failed on tail flush");
-            qt_log(QT_LOG_ERROR, "[Pipeline] streaming codec decode failed on tail flush");
-            return QT_STATUS_GENERATE_FAILED;
-        }
         out->samples     = NULL;
         out->n_samples   = 0;
         out->sample_rate = TOKENIZER_SAMPLE_RATE;

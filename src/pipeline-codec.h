@@ -31,6 +31,7 @@
 #include "ggml-backend.h"
 #include "gguf-weights.h"
 #include "graph-arena.h"
+#include "kv-cache.h"
 #include "quantizer-decode.h"
 #include "quantizer-encode.h"
 #include "seanet-encoder.h"
@@ -76,6 +77,34 @@ struct PipelineCodec {
     // so constant size streaming slices replay a captured executable.
     GraphArena dec_arena;
 
+    // Stateful streaming decoder: every causal conv left context, every
+    // transposed conv overlap carry, and the transformer sliding window
+    // KV ring live as backend resident tensors, so a T=1 frame decode
+    // reproduces the offline full decode exactly with zero re-decoded
+    // context. Loaded lazily on the first pipeline_codec_stream_reset:
+    // the buffered chunked path never pays for it.
+    bool                    stream_ready;
+    struct ggml_context *   stream_ctx;
+    ggml_backend_buffer_t   stream_buf;
+    struct ggml_tensor *    stream_pre_conv;  // pre_conv k=3, [2, 512]
+    QwenUpsampleStreamState stream_up;
+    QwenDACStreamState      stream_dac;
+    KVCache                 stream_kv;   // tok transformer ring, [hd, ring, n_kv] per layer
+    int                     stream_pos;  // absolute frame position, drives RoPE and ring slots
+
+    // Static frame graph: the T=1 topology and every tensor address are
+    // constant, so the graph builds and allocates once and every frame
+    // is input uploads + one backend compute + one readback. The single
+    // backend runs the whole graph, no scheduler involved.
+    struct ggml_context * stream_graph_ctx;
+    struct ggml_cgraph *  stream_gf;
+    ggml_gallocr_t        stream_galloc;
+    struct ggml_tensor *  stream_in_codes;
+    struct ggml_tensor *  stream_in_pos;
+    struct ggml_tensor *  stream_in_rows;
+    struct ggml_tensor *  stream_in_mask;
+    struct ggml_tensor *  stream_out;
+
     // CPU mirror of the RVQ encode side, lazy-loaded on first encode call.
     QwenQuantizerEncodeHost qenc_sem_host;
     QwenQuantizerEncodeHost qenc_aco_host;
@@ -98,6 +127,19 @@ bool pipeline_codec_ensure_encoder(PipelineCodec * pc);
 //   codes: flat int32 buffer, [K, T] row-major (T fastest).
 // Returns audio of length T * TOKENIZER_HOP_LENGTH, empty on failure.
 std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * codes, int K, int T);
+
+// Reset the stateful streaming decoder to the zero context: allocates
+// the state tensors on first call, clears every conv left context,
+// transposed conv carry, and the transformer KV ring, and rewinds the
+// absolute position. Call once before each streamed utterance.
+bool pipeline_codec_stream_reset(PipelineCodec * pc);
+
+// Decode one frame through the stateful streaming path. codes holds the
+// K codebook entries of a single frame; the persistent state advances
+// as a side effect. When audio_out is non NULL the frame's
+// TOKENIZER_HOP_LENGTH samples copy into it; a NULL audio_out primes
+// the state without a readback (ICL reference priming).
+bool pipeline_codec_decode_stream(PipelineCodec * pc, const int32_t * codes, float * audio_out);
 
 // Encode a 24 kHz mono waveform into RVQ codes.
 //   audio    : [n_samples] f32 mono 24 kHz. Must be a multiple of

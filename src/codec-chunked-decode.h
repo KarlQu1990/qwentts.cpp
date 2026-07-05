@@ -20,7 +20,7 @@
 //     fits in a single chunk_frames sized window. Bounds VRAM beyond
 //     that, mirrors the upstream chunked_decode loop frame for frame.
 //
-//   codec_chunked_decoder_stream : rolling state for AR streaming.
+//   codec_stream_decoder : stateful frame by frame AR streaming.
 //     The pipeline pushes one frame at a time as the talker produces
 //     them ; push_frame decodes and emits a fresh chunk_frames sized
 //     audio block through the on_chunk callback as soon as enough new
@@ -84,106 +84,60 @@ static inline std::vector<float> codec_chunked_decode(PipelineCodec * pc,
     return out;
 }
 
-// Rolling streaming decoder. Stores codes K major as K parallel vectors
-// (by_k[k][t]) so emit_one can memcpy a contiguous K major slice into
-// pipeline_codec_decode without a transpose. push_frame triggers as
-// many emits as possible after appending one frame ; flush emits the
-// tail at EOS.
-struct codec_chunked_decoder_stream {
-    std::vector<std::vector<int32_t>> by_k;
-    int                               K;
-    int                               T_so_far;
-    int                               chunk_frames;
-    int                               left_ctx_frames;
-    int                               emit_start_frame;
-    // Set true when an emit returned false because the on_chunk callback
-    // requested a cancel. Stays false on decode failures so the caller
-    // can route to QT_STATUS_CANCELLED vs QT_STATUS_GENERATE_FAILED on
-    // a push_frame / flush negative return.
-    bool                              cancelled;
+// Stateful streaming decoder over pipeline_codec_decode_stream: every
+// pushed frame decodes immediately through the persistent codec state
+// and emits its TOKENIZER_HOP_LENGTH samples, no buffering, no left
+// context re-decode, no tail to drain at EOS. ICL priming feeds the
+// full reference through the same state with the audio discarded,
+// which matches the upstream reference plus generated decode exactly.
+struct codec_stream_decoder {
+    int  K;
+    // Set true when push_frame returned false because the on_chunk
+    // callback requested a cancel. Stays false on decode failures so
+    // the caller can route to QT_STATUS_CANCELLED vs
+    // QT_STATUS_GENERATE_FAILED on a negative return.
+    bool cancelled;
 
-    void init(int K_, int chunk_frames_, int left_ctx_frames_) {
-        K                = K_;
-        T_so_far         = 0;
-        chunk_frames     = chunk_frames_ < 1 ? 1 : chunk_frames_;
-        left_ctx_frames  = left_ctx_frames_ < 0 ? 0 : left_ctx_frames_;
-        emit_start_frame = 0;
-        cancelled        = false;
-        by_k.assign((size_t) K, {});
+    std::vector<float> frame;
+
+    // Reset the persistent codec state to the zero context. Returns
+    // false when the state allocation fails.
+    bool init(PipelineCodec * pc, int K_) {
+        K         = K_;
+        cancelled = false;
+        frame.assign((size_t) TOKENIZER_HOP_LENGTH, 0.0f);
+        return pipeline_codec_stream_reset(pc);
     }
 
-    // Seed the left context with the tail of the ICL reference codes so
-    // the first emitted chunk draws causal context from the reference
-    // instead of an empty decoder state, matching the upstream pipeline
-    // which decodes reference plus generated then trims. ref_kt is K
-    // major [K, ref_T]; the last min(ref_T, left_ctx_frames) frames are
-    // kept. Call once, after init and before any push_frame; the seeded
-    // frames sit below emit_start_frame so they are never emitted.
-    void seed_reference(const int32_t * ref_kt, int ref_T) {
-        int seed = ref_T < left_ctx_frames ? ref_T : left_ctx_frames;
-        if (seed <= 0) {
-            return;
-        }
-        for (int k = 0; k < K; k++) {
-            const int32_t * row = ref_kt + (size_t) k * (size_t) ref_T + (size_t) (ref_T - seed);
-            by_k[(size_t) k].insert(by_k[(size_t) k].end(), row, row + seed);
-        }
-        T_so_far         = seed;
-        emit_start_frame = seed;
-    }
-
-    // Append one frame (K int32 codes, one per codebook). Drain any
-    // chunks that became emittable. Returns false on decode failure or
-    // when cb returns false (cancellation).
-    bool push_frame(PipelineCodec * pc, const int32_t * frame_codes, qt_audio_chunk_cb cb, void * cb_ud) {
-        for (int k = 0; k < K; k++) {
-            by_k[(size_t) k].push_back(frame_codes[k]);
-        }
-        T_so_far++;
-
-        while (T_so_far - emit_start_frame >= chunk_frames) {
-            if (!emit_one(pc, emit_start_frame + chunk_frames, cb, cb_ud)) {
+    // Prime the codec state with the full ICL reference: every frame
+    // runs through the streaming decode with the audio discarded, so
+    // the first generated frame sees the reference's exact causal
+    // state. ref_kt is K major [K, ref_T]. Call once, after init and
+    // before any push_frame.
+    bool seed_reference(PipelineCodec * pc, const int32_t * ref_kt, int ref_T) {
+        std::vector<int32_t> codes((size_t) K);
+        for (int t = 0; t < ref_T; t++) {
+            for (int k = 0; k < K; k++) {
+                codes[(size_t) k] = ref_kt[(size_t) k * (size_t) ref_T + (size_t) t];
+            }
+            if (!pipeline_codec_decode_stream(pc, codes.data(), NULL)) {
                 return false;
             }
         }
         return true;
     }
 
-    // Drain the tail. If frames remain past emit_start_frame, decode
-    // them with left context and emit one final short chunk. Idempotent
-    // on empty tail.
-    bool flush(PipelineCodec * pc, qt_audio_chunk_cb cb, void * cb_ud) {
-        if (T_so_far > emit_start_frame) {
-            return emit_one(pc, T_so_far, cb, cb_ud);
-        }
-        return true;
-    }
-
-  private:
-    // Decode [emit_start_frame - ctx .. end_frame] with left context
-    // stripped from the emitted samples, then advance emit_start_frame.
-    bool emit_one(PipelineCodec * pc, int end_frame, qt_audio_chunk_cb cb, void * cb_ud) {
-        int ctx         = (emit_start_frame - left_ctx_frames > 0) ? left_ctx_frames : emit_start_frame;
-        int slice_start = emit_start_frame - ctx;
-        int slice_T     = end_frame - slice_start;
-
-        std::vector<int32_t> slice((size_t) K * (size_t) slice_T);
-        for (int k = 0; k < K; k++) {
-            std::memcpy(slice.data() + (size_t) k * (size_t) slice_T, by_k[(size_t) k].data() + (size_t) slice_start,
-                        (size_t) slice_T * sizeof(int32_t));
-        }
-        std::vector<float> wav = pipeline_codec_decode(pc, slice.data(), K, slice_T);
-        if (wav.empty()) {
+    // Decode one frame (K int32 codes, one per codebook) and emit its
+    // samples through the callback. Returns false on decode failure or
+    // when cb returns false (cancellation).
+    bool push_frame(PipelineCodec * pc, const int32_t * frame_codes, qt_audio_chunk_cb cb, void * cb_ud) {
+        if (!pipeline_codec_decode_stream(pc, frame_codes, frame.data())) {
             return false;
         }
-        const size_t  drop       = (size_t) ctx * (size_t) TOKENIZER_HOP_LENGTH;
-        const float * emit_first = wav.data() + drop;
-        int           emit_n     = (int) (wav.size() - drop);
-        if (emit_n > 0 && !cb(emit_first, emit_n, cb_ud)) {
+        if (!cb(frame.data(), TOKENIZER_HOP_LENGTH, cb_ud)) {
             cancelled = true;
             return false;
         }
-        emit_start_frame = end_frame;
         return true;
     }
 };
