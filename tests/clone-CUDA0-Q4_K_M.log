@@ -1,4 +1,4 @@
-[Qwen] qwentts.cpp 3e3b6c1 (2026-07-04)
+[Qwen] qwentts.cpp f84fc05 (2026-07-04)
 ggml_cuda_init: found 1 CUDA devices (Total VRAM: 97247 MiB):
   Device 0: NVIDIA RTX PRO 6000 Blackwell Workstation Edition, compute capability 12.0, VMM: yes, VRAM: 97247 MiB
 load_backend: loaded CUDA backend from /mnt/workspace/git/qwentts.cpp/build/libggml-cuda.so
@@ -33,7 +33,7 @@ load_backend: loaded CPU backend from /mnt/workspace/git/qwentts.cpp/build/libgg
 [Audio-Resample] Done: 380672 -> 414337 samples
 [WeightCtx] Loaded 76 tensors, 34.9 MB into backend
 [SpeakerEncoder] Loaded: enc_dim=2048 sr=24000 mel_dim=128 hidden=512 mfa=1536 asp_attn=128 se=128 scale=8
-[Pipeline] Speaker encoder lazy loaded in 27 ms
+[Pipeline] Speaker encoder lazy loaded in 3 ms
 [Debug] mel-spk: [1618, 128] first4: -6.330339 -6.170074 -6.011195 -6.243161
 [Debug] mel-hann: [1024] first4: 0.000000 0.000009 0.000038 0.000085
 [Debug] mel-basis: [128, 513] first4: 0.000000 0.033550 0.008569 0.000000
@@ -51,7 +51,7 @@ load_backend: loaded CPU backend from /mnt/workspace/git/qwentts.cpp/build/libgg
 [EncDownsample] Loaded: k=4 stride=2, 512 -> 512 channels, weights 2.0 MB
 [WeightCtx] Loaded 20 tensors, 34.0 MB into backend
 [EncQuantizer] Loaded: 16 codebooks (1 semantic + 15 acoustic), 2048 entries x 256 dim, hidden 512, weights 34.0 MB
-[Pipeline] Codec encoder lazy loaded in 44 ms
+[Pipeline] Codec encoder lazy loaded in 7 ms
 [Debug] audio-input: [412800] first4: -0.000546 -0.001162 -0.000871 0.000340
 [Debug] seanet-out: [430, 512] first4: -0.134336 13.731120 -0.351051 3.013485
 [Debug] enc-transformer-out: [430, 512] first4: 1.140990 3.713432 0.131578 0.616251
@@ -98,20 +98,35 @@ load_backend: loaded CPU backend from /mnt/workspace/git/qwentts.cpp/build/libgg
 [Sample] step=1 c0=99 u=-1.0000000000 subseq=16
 ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=0 c=43 u=-1.0000000000 subseq=17
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=1 c=1859 u=-1.0000000000 subseq=18
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=2 c=22 u=-1.0000000000 subseq=19
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=3 c=239 u=-1.0000000000 subseq=20
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=4 c=915 u=-1.0000000000 subseq=21
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=5 c=2019 u=-1.0000000000 subseq=22
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=6 c=329 u=-1.0000000000 subseq=23
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=7 c=241 u=-1.0000000000 subseq=24
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=8 c=1004 u=-1.0000000000 subseq=25
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=9 c=826 u=-1.0000000000 subseq=26
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=10 c=1603 u=-1.0000000000 subseq=27
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=11 c=1160 u=-1.0000000000 subseq=28
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=12 c=1759 u=-1.0000000000 subseq=29
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=13 c=591 u=-1.0000000000 subseq=30
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Sample-CP] g=14 c=901 u=-1.0000000000 subseq=31
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 ggml_backend_cuda_graph_compute: CUDA graph warmup complete
@@ -144,6 +159,8 @@ ggml_backend_cuda_graph_compute: CUDA graph warmup reset
 ggml_backend_cuda_graph_compute: CUDA graph warmup reset
 ggml_backend_cuda_graph_compute: CUDA graph warmup reset
 ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 ggml_backend_cuda_graph_compute: CUDA graph warmup complete
@@ -166,13 +183,13 @@ ggml_backend_cuda_graph_compute: CUDA graph warmup complete
 [Debug] codes-full: [64, 16] first4: 27.000000 1042.000000 390.000000 881.000000
 [Debug] output-audio: [122880] first4: 0.000087 0.000212 -0.000383 -0.000346
 [Perf] PromptBuild 55.2 ms
-[Perf] Prefill 14.2 ms (T_ctx prefill)
-[Perf] TTFA 77.1 ms (first frame codes)
-[Perf] TalkerDecode 231.8 ms (64 frames, 3.62 ms/frame)
-[Perf] CodePredictor 358.2 ms (5.60 ms/frame)
+[Perf] Prefill 14.4 ms (T_ctx prefill)
+[Perf] TTFA 78.1 ms (first frame codes)
+[Perf] TalkerDecode 220.3 ms (64 frames, 3.44 ms/frame)
+[Perf] CodePredictor 327.3 ms (5.11 ms/frame)
 [Perf] HostCompose 0.1 ms (c0 sample + next emb)
-[Perf] CodecDecode 15.8 ms
-[Perf] Total 676.2 ms (64 frames, 9.22 ms/frame AR, audio 5.12 s, RTF 0.132)
+[Perf] CodecDecode 15.7 ms
+[Perf] Total 634.2 ms (64 frames, 8.56 ms/frame AR, audio 5.12 s, RTF 0.124)
 [WAV] Wrote cpp/clone/clone-cpp.wav: 122880 samples, 24000 Hz, mono S16
 [Pipeline] Wrote 122880 samples (5.12 s) -> cpp/clone/clone-cpp.wav
 [Input] Prompt: 100 chars: qwentts.cpp is a minimal C++17 and GGML port of Qwen3-TTS fo...
